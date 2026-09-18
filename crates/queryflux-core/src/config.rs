@@ -1127,6 +1127,8 @@ pub struct ClusterConfig {
     pub endpoint: Option<String>,
     /// Local file path for DuckDB.
     pub database_path: Option<String>,
+    /// S3 endpoint for DuckDB.
+    pub s3_endpoint: Option<String>,
     /// AWS region for cloud backends (e.g. `us-east-1`). Required for Athena.
     pub region: Option<String>,
     /// S3 URI where Athena writes query results (e.g. `s3://my-bucket/athena-results/`).
@@ -3121,6 +3123,7 @@ queryflux:
             pool_size: None,
             endpoint: None,
             database_path: None,
+            s3_endpoint: None,
             region: None,
             s3_output_location: None,
             workgroup: None,

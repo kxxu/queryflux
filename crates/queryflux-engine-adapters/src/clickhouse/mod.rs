@@ -864,6 +864,7 @@ mod tests {
             pool_size: None,
             endpoint: None,
             database_path: None,
+            s3_endpoint: None,
             region: None,
             s3_output_location: None,
             workgroup: None,

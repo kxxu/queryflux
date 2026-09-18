@@ -139,6 +139,7 @@ pub fn cluster_config_from_persisted_json(
         pool_size: json_pool_size(config),
         endpoint: json_str(config, "endpoint"),
         database_path: None,
+        s3_endpoint: None,
         region: None,
         s3_output_location: None,
         workgroup: None,

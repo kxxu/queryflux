@@ -1,8 +1,10 @@
 pub mod http;
 
+use std::arch::is_s390x_feature_detected;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use adbc_core::constants::ADBC_OPTION_ISOLATION_LEVEL_DEFAULT;
 use async_trait::async_trait;
 use duckdb::Connection;
 use queryflux_core::{
@@ -16,7 +18,7 @@ use queryflux_core::{
 };
 use tokio::sync::Semaphore;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::{AdapterKind, BackendQueryIdSlot, SyncAdapter, SyncExecution};
 use queryflux_core::engine_registry::{
@@ -33,6 +35,10 @@ pub struct DuckDbConfig {
     pub motherduck_token: Option<String>,
     pub pool_size: usize,
     pub max_result_buffer_bytes: usize,
+    pub endpoint: Option<String>,
+    pub catalog: Option<String>,
+    pub auth: Option<ClusterAuth>,
+    pub s3_endpoint: Option<String>,
 }
 
 fn parse_pool_size(raw: Option<usize>, cluster_name: &str) -> Result<usize> {
@@ -113,11 +119,30 @@ impl crate::EngineConfigParseable for DuckDbConfig {
                 )));
             }
         };
+        let endpoint = json_str(json, "endpoint");
+        let catalog = json_str(json, "catalog");
+        let auth = parse_auth_from_config_json(json).map_err(|e| {
+            queryflux_core::error::QueryFluxError::Engine(format!(
+                "cluster '{cluster_name}': invalid auth ({e})"
+            ))
+        })?;
+        let s3_endpoint = json_str(json, "s3_endpoint");
+        if let Some(ref a) = auth {
+            if !matches!(a, ClusterAuth::AccessKey { .. }) {
+                return Err(queryflux_core::error::QueryFluxError::Engine(format!(
+                    "cluster '{cluster_name}': duckDB quack only supports access auth (S3 AK/SK/token)"
+                )));
+            }
+        }
         Ok(Self {
             database_path,
             motherduck_token,
             pool_size: parse_pool_size_from_json(json, cluster_name)?,
             max_result_buffer_bytes: parse_max_result_buffer_from_json(json, cluster_name)?,
+            endpoint,
+            catalog,
+            auth,
+            s3_endpoint,
         })
     }
 
@@ -139,6 +164,10 @@ impl crate::EngineConfigParseable for DuckDbConfig {
                 cfg.max_result_buffer_bytes,
                 cluster_name,
             )?,
+            endpoint: cfg.endpoint.clone(),
+            catalog: cfg.catalog.clone(),
+            auth: cfg.auth.clone(),
+            s3_endpoint: cfg.s3_endpoint.clone(),
         })
     }
 }
@@ -181,8 +210,13 @@ impl DuckDbAdapter {
         config: DuckDbConfig,
     ) -> Result<Self> {
         let mut slots = Vec::with_capacity(config.pool_size);
+        let master_conn = open_duckdb_connection(&config)?;
+        init_connection(&master_conn, &config)?;
+        let catalog_name = config.catalog.as_deref().unwrap_or("main");
         for _ in 0..config.pool_size {
-            let conn = open_duckdb_connection(&config)?;
+            let conn = master_conn.try_clone().map_err(|e| QueryFluxError::Engine(format!("DuckDB try_clone conn failed: {e}")))?;
+            let use_sql = format!(r#"USE "{}";"#, catalog_name);
+            conn.execute(&use_sql, []).map_err(|e| QueryFluxError::Engine(format!("DuckDB conn use {catalog_name} failed: {e}")))?;
             let interrupt = conn.interrupt_handle();
             slots.push(ConnectionSlot {
                 conn: Arc::new(Mutex::new(conn)),
@@ -199,6 +233,63 @@ impl DuckDbAdapter {
             next_slot: AtomicUsize::new(0),
             max_result_buffer_bytes: config.max_result_buffer_bytes,
         })
+    }
+    fn init_connection(conn: &duckdb::Connection, config: &DuckDbConfig) -> Result<()> {
+        conn.execute_batch(r#"
+            install ducklake; load ducklake;
+            install quack; load quack;
+            install httpfs; load httpfs;
+        "#).map_err(|e| QueryFluxError::Engine(format!("DuckDB execute_batch install failed: {e}")))?;
+
+        if let (Some(s3_endpoint), Some(auth_value)) = (&config.s3_endpoint, &config.auth) {
+            match auth_value {
+                ClusterAuth::AccessKey { access_key_id, secret_access_key, session_token } => {
+                    conn.execute(r#"
+                        CREATE OR REPLACE SECRET rustfs_sec (
+                            TYPE s3,
+                            PROVIDER config,
+                            KEY_ID ?,
+                            SECRET ?,
+                            ENDPOINT ?,
+                            USE_SSL false,
+                            URL_STYLE 'path',
+                            REGION 'us-east-1'
+                        );
+                    "#,
+                    [access_key_id, secret_access_key, s3_endpoint]).map_err(|e| QueryFluxError::Engine(format!("DuckDB create S3 secret failed: {e}")))?;
+                    if let Some(session_token) = session_token {
+                        conn.execute(r#"
+                            create secret(TYPE quack, TOKEN ?);
+                        "#, [session_token]).map_err(|e| QueryFluxError::Engine(format!("DuckDB create quack secret failed: {e}")))?;
+                        let quack_endpoint = config.endpoint.as_deref().unwrap_or("quack://localhost:9494");
+
+                        // 保证前缀正确，例如 quack://localhost:9494
+                        let connection_string = if quack_endpoint.starts_with("quack://") {
+                            quack_endpoint.to_string()
+                        } else {
+                            format!("quack://{}", quack_endpoint)
+                        };
+                        conn.execute(r#"
+                            "ATTACH ? AS remote (READ_ONLY);"
+                        "#, [&connection_string]).map_err(|e| QueryFluxError::Engine(format!("DuckDB attach remote {connection_string} failed: {e}")))?;
+                        conn.execute(r#"
+                            connect remote;
+                        "#, []).map_err(|e| QueryFluxError::Engine(format!("DuckDB connect remote failed: {e}")))?;
+
+                        info!("init duckDB quack success, quack endpoint: {quack_endpoint}");
+                    } else {
+                        return Err(QueryFluxError::Engine("DuckDB quack token(auth.session_token) is None".to_string()));
+                    }
+
+                },
+                _ => {
+                    info!("DuckDB auth type is not ClusterAuth::AccessKey, auth: {:?}", config.auth);
+                }
+
+            }
+        };
+
+        Ok(())
     }
 
     fn pick_slot(&self) -> ConnectionSlot {
@@ -742,6 +833,9 @@ mod tests {
                 motherduck_token: None,
                 pool_size: 1,
                 max_result_buffer_bytes: DEFAULT_MAX_RESULT_BUFFER_BYTES,
+                endpoint: None,
+                catalog: None,
+                auth: None,
             },
         )
         .expect("open in-memory duckdb");
@@ -800,6 +894,9 @@ mod tests {
                     motherduck_token: None,
                     pool_size: 1,
                     max_result_buffer_bytes: DEFAULT_MAX_RESULT_BUFFER_BYTES,
+                    endpoint: None,
+                    catalog: None,
+                    auth: None,
                 },
             )
             .expect("open in-memory duckdb"),
@@ -903,6 +1000,9 @@ mod tests {
                 motherduck_token: None,
                 pool_size: 1,
                 max_result_buffer_bytes: DEFAULT_MAX_RESULT_BUFFER_BYTES,
+                endpoint: None,
+                catalog: None,
+                auth: None,
             },
         )
         .expect("open in-memory duckdb");
@@ -954,6 +1054,9 @@ mod tests {
                 motherduck_token: None,
                 pool_size: 1,
                 max_result_buffer_bytes: DEFAULT_MAX_RESULT_BUFFER_BYTES,
+                endpoint: None,
+                catalog: None,
+                auth: None,
             },
         )
         .expect("open in-memory duckdb");
@@ -1003,6 +1106,9 @@ mod tests {
                 motherduck_token: None,
                 pool_size: 1,
                 max_result_buffer_bytes: 4096,
+                endpoint: None,
+                catalog: None,
+                auth: None,
             },
         )
         .expect("open in-memory duckdb");
