@@ -44,6 +44,10 @@ pub enum QueryFluxError {
     #[error("Cluster not found: {0}")]
     ClusterNotFound(String),
 
+    /// This instance has no config yet (a worker before its first snapshot). Retryable.
+    #[error("QueryFlux is not configured yet: {0}")]
+    NotConfigured(String),
+
     #[error("No cluster group available: {0}")]
     NoClusterGroupAvailable(String),
 
@@ -106,6 +110,9 @@ impl QueryFluxError {
     pub fn is_transient(&self) -> bool {
         match self {
             QueryFluxError::BackendFailure(_) | QueryFluxError::BackendTimeout(_) => true,
+            // A worker waiting for its first config: the same request succeeds once the
+            // control plane's config is activated.
+            QueryFluxError::NotConfigured(_) => true,
             // Persistence errors: inspect the message for sqlx error kinds.
             // Connection-level and pool errors are transient; constraint
             // violations and type errors are permanent.
@@ -153,6 +160,11 @@ mod tests {
         assert!(msg.contains("analytics"), "{msg}");
         assert!(msg.contains("5/5"), "{msg}");
         assert!(!err.is_transient());
+    }
+
+    #[test]
+    fn not_configured_is_transient() {
+        assert!(QueryFluxError::NotConfigured("waiting for config".into()).is_transient());
     }
 
     #[test]
