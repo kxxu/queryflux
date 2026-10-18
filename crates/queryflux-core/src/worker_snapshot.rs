@@ -55,6 +55,18 @@ pub struct WorkerSnapshotV1 {
     /// control plane's own `/worker/query-records`, unredacted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<HistoryPolicy>,
+    /// What to do when required SQL translation is unavailable or fails. `None` keeps the
+    /// worker's default (best effort).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translation: Option<TranslationPolicy>,
+}
+
+/// The control plane's `translation.mode` and `translation.errorOnUnsupported`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranslationPolicy {
+    pub mode: crate::config::TranslationMode,
+    pub error_on_unsupported: bool,
 }
 
 /// Where a worker sends its query records, and what they may contain.
@@ -87,7 +99,7 @@ pub enum HistoryRedaction {
 /// insertion order when any crate in the build enables `serde_json/preserve_order`, and
 /// `HashMap` fields insert in a per-process random order, so plain serialization would give
 /// the same config different revisions on different control plane replicas.
-fn write_canonical(value: &serde_json::Value, out: &mut Vec<u8>) {
+pub fn write_canonical(value: &serde_json::Value, out: &mut Vec<u8>) {
     match value {
         serde_json::Value::Object(map) => {
             let mut entries: Vec<_> = map.iter().collect();
@@ -297,6 +309,7 @@ mod tests {
             routing_fallback: "analytics".into(),
             group_translation_scripts: BTreeMap::new(),
             history: None,
+            translation: None,
             settings: SnapshotSettings {
                 security: Some(serde_json::json!({
                     "provider": "oidc",

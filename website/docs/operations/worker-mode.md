@@ -83,6 +83,10 @@ queryflux:
     pollTimeoutSecs: 30          # long-poll hold time
     heartbeatIntervalSecs: 10
     allowInsecureHttp: false     # local demos only: snapshots carry credentials
+    peerBootstrap:               # optional: start from a running worker's config
+      address: queryflux-workers:9000
+      afterSecs: 10
+      maxAgeSecs: 86400
   coordination:
     mode: controlPlane           # controlPlane | local
     onUnavailable: failClosed    # failClosed | localLimits
@@ -95,13 +99,13 @@ queryflux:
     port: 9000                   # ops listener: /health, /readyz, /metrics, /worker/status
 ```
 
-Everything the control plane owns is rejected in a worker config: `persistence` (other than `inMemory`), clusters, groups, routers, `routingFallback`, `auth`, `authorization`, `catalogProvider`, `guardrails`, `accessControl` and `workerApi`. `queryflux validate` lists any such settings it finds.
+Everything the control plane owns is rejected in a worker config: `persistence` (other than `inMemory`), clusters, groups, routers, `routingFallback`, `auth`, `authorization`, `catalogProvider`, `guardrails`, `accessControl`, `translation.mode`, `translation.errorOnUnsupported` and `workerApi`. Other `translation` settings (`pythonScripts`, `schemaResolutionTimeoutMs`) stay local to the worker for now. `queryflux validate` lists any such settings it finds.
 
 QueryFlux does not expand environment variables in its config file. Mount a worker config that holds the shared secret from a Kubernetes Secret.
 
 ## How config reaches workers
 
-1. **Snapshot.** The control plane serves `GET /worker/config`. The response is everything a worker needs to compile its live config: clusters, groups, routers, translation scripts, settings and the history policy. Its `revision` is a content hash, so the same config has the same revision on every control plane replica.
+1. **Snapshot.** The control plane serves `GET /worker/config`. The response is everything a worker needs to compile its live config: clusters, groups, routers, translation scripts, settings, the history policy and the translation failure policy (`translation.mode` and `errorOnUnsupported`, applied without a restart). Its `revision` is a content hash, so the same config has the same revision on every control plane replica.
 2. **Change detection.** The worker long-polls `GET /worker/config/wait?since=<revision>`. The control plane answers as soon as its config changes, usually in under a second. Otherwise it answers after `pollTimeoutSecs` with `304 Not Modified`.
 3. **Activation.** A new snapshot is verified (schema version, revision hash) and compiled strictly: an invalid adapter or script rejects the whole snapshot. Only then is it swapped in atomically. A rejected snapshot leaves the previous one active, and the worker reports the error in its heartbeat and in `/worker/status`.
 4. **Before the first snapshot.** The worker accepts connections, but queries get a retryable "not configured" error:
@@ -116,6 +120,23 @@ QueryFlux does not expand environment variables in its config file. Mount a work
    `/readyz` returns `503` until the first snapshot is active. Use it as the startup probe.
 
 While the control plane is unreachable, a worker keeps serving the last config it activated, and retries with backoff (with jitter, up to 60 seconds).
+
+### Starting while the control plane is down
+
+Any config a worker starts with while the control plane is down may be missing recent edits. Two mechanisms keep it as recent as possible, and make its age visible:
+
+- **The control plane serves its last good config.** If building the config from Postgres fails or takes longer than 10 seconds, the control plane serves the last config it built. Run 2+ control-plane replicas, and a Postgres outage does not stop workers from starting.
+- **Peer bootstrap** (`controlPlane.peerBootstrap`, off unless set). A worker that has no config, and still cannot sync from the control plane after `afterSecs`, copies the active config from a running worker:
+  - **Where it looks:** `address` is resolved and each address is tried in turn. It can be the worker Service, which routes only to ready workers, all of which have a config, or a headless Service.
+  - **Authentication:** peers serve `/worker/peer-config` on their ops port, behind the fleet's shared secret.
+  - **Age limit:** a copy whose config the control plane last confirmed more than `maxAgeSecs` ago is refused.
+  - **What it does not cover:** a full fleet restart during an outage, because no peer has a config to share.
+
+A worker running a copied config reports it:
+- `/worker/status` shows `configSource: peer`, `stale: true` and `confirmedAt`, the last time the control plane confirmed that config.
+- `queryflux_worker_config_stale` is `1`.
+
+The worker checks the copy with the control plane as soon as the control plane answers. A changed config is fetched and activated, and an unchanged one is confirmed. Either way the stale flag clears. Peer traffic carries the full config, credentials included, so keep the ops port inside the cluster: use a NetworkPolicy, and mTLS from a service mesh.
 
 Each worker registers on start and heartbeats every `heartbeatIntervalSecs`. The control plane's `worker_registry` table holds each worker's name, labels, version, active revision, last error and last-seen time.
 
@@ -135,6 +156,18 @@ One `maxRunningQueries` therefore holds across the control plane and every worke
 | Control plane down, `onUnavailable: failClosed` (default) | New queries wait in the queue until the capacity wait timeout. Running queries finish. |
 | Control plane down, `onUnavailable: localLimits` | New queries are admitted against the worker's own limit. The fleet can exceed the global limit until the control plane returns. |
 | `mode: local` | Limits apply to each worker alone. Use this only when one worker serves a group. |
+
+**Fairness.** The shared limit is a hard cap, but queries waiting on different workers are not served in one global order: each worker retries for its own waiting queries. To check whether some workers wait more than others for the same group, compare per worker (per scraped pod):
+
+```promql
+# 95th percentile time spent waiting for capacity, per worker
+histogram_quantile(0.95, sum by (pod, cluster_group, le) (rate(queryflux_queue_duration_seconds_bucket[10m])))
+
+# how often each worker had local room but the shared limit was full
+sum by (pod, cluster_group) (rate(queryflux_capacity_lease_denied_total[10m]))
+```
+
+A consistently higher wait on some workers for the same group means waiters are being starved. An ordered wait queue on the control plane is planned for that case.
 
 Each worker sweeps its own zombie and stale queued queries. Those live in its memory.
 
@@ -173,12 +206,14 @@ Cluster snapshots are not sent upstream. With shared capacity, the control plane
 | `/health` | Liveness |
 | `/readyz` | `200` once a config snapshot is active |
 | `/metrics` | Prometheus metrics for this worker |
-| `/worker/status` | Revisions (downloaded, active), last sync, last error, history policy and delivery counters (`queued`, `sent`, `dropped`, `lastError`) |
+| `/worker/status` | Revisions (downloaded, active), config source and staleness, last sync, last error, history policy and delivery counters (`queued`, `sent`, `dropped`, `lastError`) |
+| `/worker/peer-config` | With `peerBootstrap` set: the active config, for workers starting without the control plane (shared secret required) |
 
 **Things to alert on:**
 
 - `consecutiveFailures` growing in `/worker/status`, or `queryflux_config_reload_failures_total{stage="worker_activate"}`. The worker is serving a stale config.
 - `queryflux_coordination_failures_total` on workers. With `failClosed`, new queries are waiting on the control plane.
+- `queryflux_worker_config_stale` at `1` for long. The worker started from a peer's config and the control plane has not answered since.
 - `historyUplink.dropped` above zero. The history endpoint was down longer than the spool lasted.
 
 **Upgrades.** The snapshot and history formats are versioned (`schemaVersion`). Upgrade the control plane first. A worker rejects a snapshot version it does not understand and keeps its active config.
@@ -207,5 +242,8 @@ See the [Helm chart README](https://github.com/lakeops-org/queryflux/blob/main/c
 
 ## Limitations
 
-- Snowflake HTTP sessions and MCP sessions live in each worker's memory. For a shared-service worker with more than one replica, use sticky sessions, as described in [Multi-replica operations](./multi-replica).
+- A running query lives in the memory of the worker that started it. That covers Trino result polls (`nextUri` points at the address the client used) and Snowflake and MCP sessions.
+  - For a shared-service worker with more than one replica, set `service.sessionAffinity: ClientIP` in the Helm values (`worker-values.yaml` does), and use sticky sessions on any external load balancer.
+  - Sidecar workers are not affected.
+  - Forwarding a request to the worker that owns the query, so that any load balancer works, is planned.
 - Per-worker credentials, secret references in snapshots, and a site agent that forwards for many workers are planned.

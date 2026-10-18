@@ -196,6 +196,14 @@ impl ProxyConfig {
                     ("catalogProvider", is_set(&self.catalog_provider)),
                     ("guardrails", self.guardrails.is_some()),
                     ("accessControl", self.access_control.is_some()),
+                    (
+                        "translation.mode",
+                        self.translation.mode != TranslationMode::default(),
+                    ),
+                    (
+                        "translation.errorOnUnsupported",
+                        self.translation.error_on_unsupported,
+                    ),
                 ];
                 for (key, set) in owned_by_control_plane {
                     if set {
@@ -897,6 +905,33 @@ pub struct ControlPlaneClientConfig {
     /// Allow `http://` (development only: snapshots can carry engine credentials).
     #[serde(default)]
     pub allow_insecure_http: bool,
+    /// Copy the active config from a running worker when the control plane cannot be
+    /// reached at startup. Off unless set.
+    #[serde(default)]
+    pub peer_bootstrap: Option<PeerBootstrapConfig>,
+}
+
+/// Where a worker finds peers to copy its config from, and how old a copy may be.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerBootstrapConfig {
+    /// `host:port` of the workers' ops listeners, usually a headless Service that resolves
+    /// to every worker pod (e.g. `queryflux-workers-headless:9000`).
+    pub address: String,
+    /// How long to try the control plane at startup before asking peers.
+    #[serde(default = "default_peer_after_secs")]
+    pub after_secs: u64,
+    /// Refuse a copy whose config the control plane last confirmed longer ago than this.
+    #[serde(default = "default_peer_max_age_secs")]
+    pub max_age_secs: u64,
+}
+
+fn default_peer_after_secs() -> u64 {
+    10
+}
+
+fn default_peer_max_age_secs() -> u64 {
+    24 * 60 * 60
 }
 
 fn default_poll_timeout_secs() -> u64 {
@@ -3981,6 +4016,21 @@ queryflux:
             c.queryflux.coordination.as_ref().unwrap().on_unavailable,
             OnCoordinationUnavailable::FailClosed
         );
+        assert_eq!(c.validate_role(), Ok(()));
+    }
+
+    #[test]
+    fn a_worker_takes_its_translation_policy_from_the_control_plane() {
+        let c = parse(&format!("{WORKER}translation:\n  mode: strict\n"));
+        let issues = c.validate_role().unwrap_err();
+        assert!(
+            issues.iter().any(|i| i.contains("translation.mode")),
+            "{issues:?}"
+        );
+        // Local translation settings that are not policy stay allowed.
+        let c = parse(&format!(
+            "{WORKER}translation:\n  schemaResolutionTimeoutMs: 500\n"
+        ));
         assert_eq!(c.validate_role(), Ok(()));
     }
 
