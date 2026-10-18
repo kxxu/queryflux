@@ -6,6 +6,8 @@ image: img/queryflux-hero-banner.png
 
 # Worker mode
 
+This page is about running worker mode. For how it works and why, see the [Worker mode design](../architecture/worker-mode).
+
 In worker mode, one QueryFlux deployment owns the config and the others run queries with it:
 
 - The **control plane** owns the config in Postgres. It serves Studio and the admin API, and can run queries itself.
@@ -77,6 +79,7 @@ queryflux:
   role: worker
   workerName: checkout-7f9c      # optional; defaults to the hostname (the pod name)
   workerLabels: { team: checkout }
+  workerLabelsFile: /etc/podinfo/labels   # optional: the pod's own labels (downward API), merged over workerLabels
   controlPlane:
     url: https://queryflux-control:9000
     auth: { mode: sharedSecret, sharedSecret: <long-random-secret> }
@@ -84,7 +87,7 @@ queryflux:
     heartbeatIntervalSecs: 10
     allowInsecureHttp: false     # local demos only: snapshots carry credentials
     peerBootstrap:               # optional: start from a running worker's config
-      address: queryflux-workers:9000
+      address: queryflux-workers-headless:9000
       afterSecs: 10
       maxAgeSecs: 86400
   coordination:
@@ -127,7 +130,7 @@ Any config a worker starts with while the control plane is down may be missing r
 
 - **The control plane serves its last good config.** If building the config from Postgres fails or takes longer than 10 seconds, the control plane serves the last config it built. Run 2+ control-plane replicas, and a Postgres outage does not stop workers from starting.
 - **Peer bootstrap** (`controlPlane.peerBootstrap`, off unless set). A worker that has no config, and still cannot sync from the control plane after `afterSecs`, copies the active config from a running worker:
-  - **Where it looks:** `address` is resolved and each address is tried in turn. It can be the worker Service, which routes only to ready workers, all of which have a config, or a headless Service.
+  - **Where it looks:** `address` is resolved and each address is tried in turn. Use a headless Service (Helm: `service.headless.enabled`), which resolves to every ready worker, so one attempt can try them all. The plain worker Service also works, reaching one ready worker per attempt. Either way only ready workers are listed, and they all have a config.
   - **Authentication:** peers serve `/worker/peer-config` on their ops port, behind the fleet's shared secret.
   - **Age limit:** a copy whose config the control plane last confirmed more than `maxAgeSecs` ago is refused.
   - **What it does not cover:** a full fleet restart during an outage, because no peer has a config to share.
@@ -229,8 +232,9 @@ The migrations are forward-only: once they've run, an older QueryFlux won't star
 ## Deploying
 
 - **Docker Compose:** [`examples/worker-mode`](https://github.com/lakeops-org/queryflux/tree/main/examples/worker-mode) runs a control plane, Postgres, Studio and two workers.
-- **Helm, shared-service workers:** `charts/queryflux/examples/control-plane-values.yaml` and `worker-values.yaml`.
-- **Native sidecar** (Kubernetes 1.29+): `charts/queryflux/examples/worker-sidecar-manifest.yaml`. Run the worker as an init container with `restartPolicy: Always` and a `/readyz` startup probe. Kubernetes then starts the application only once its worker has a config, and stops the worker after the application.
+- **Helm, shared-service workers:** `charts/queryflux/examples/control-plane-values.yaml` and `worker-values.yaml`, one release each. Add `worker-autoscaling-values.yaml` to scale workers on load. Adding workers never raises a limit: with shared capacity, `maxRunningQueries` holds across the fleet.
+- **Native sidecar** (Kubernetes 1.29+): one worker inside each application pod. Step by step: [Add a worker as a sidecar](./worker-sidecar). The example manifest is `charts/queryflux/examples/worker-sidecar-manifest.yaml`.
+- **One worker per node:** `charts/queryflux/examples/worker-daemonset-values.yaml` runs workers as a DaemonSet. With `service.internalTrafficPolicy: Local`, apps keep one Service address, and each connection goes to the worker on the app's own node. There's no fallback while a node's worker restarts, so rollouts replace one node's worker at a time.
 
 See the [Helm chart README](https://github.com/lakeops-org/queryflux/blob/main/charts/queryflux/README.md#worker-mode).
 
