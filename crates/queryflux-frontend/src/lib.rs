@@ -6,6 +6,7 @@ pub mod dispatch;
 pub mod flight_sql;
 pub mod mcp;
 pub mod mysql_wire;
+pub mod ops;
 pub mod postgres_wire;
 pub mod routing_resolve;
 pub mod snowflake;
@@ -13,6 +14,7 @@ pub mod sql_pipeline;
 pub mod state;
 pub mod tee_sink;
 pub mod trino_http;
+pub mod worker_api;
 
 use async_trait::async_trait;
 use queryflux_core::error::Result;

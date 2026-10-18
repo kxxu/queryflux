@@ -672,9 +672,16 @@ pub struct AdminFrontend {
     cors_allowed_origins: Vec<String>,
     result_cache: Arc<dyn queryflux_cache::QueryResultCache>,
     app: Arc<AppState>,
+    worker_api: Option<crate::worker_api::WorkerApi>,
 }
 
 impl AdminFrontend {
+    /// Serve the worker API (`/worker/*`) on this listener (#255).
+    pub fn with_worker_api(mut self, api: crate::worker_api::WorkerApi) -> Self {
+        self.worker_api = Some(api);
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         prometheus: Arc<PrometheusMetrics>,
@@ -713,6 +720,7 @@ impl AdminFrontend {
             cors_allowed_origins,
             result_cache,
             app,
+            worker_api: None,
         }
     }
 
@@ -883,11 +891,15 @@ impl AdminFrontend {
                 .allow_headers(Any)
         };
 
-        Router::new()
+        let router = Router::new()
             .merge(public)
             .merge(protected)
-            .with_state(state)
-            .layer(cors)
+            .with_state(state);
+        let router = match &self.worker_api {
+            Some(api) => router.merge(crate::worker_api::router(api.clone())),
+            None => router,
+        };
+        router.layer(cors)
     }
 }
 
@@ -1071,7 +1083,13 @@ async fn health_handler() -> impl IntoResponse {
     )
 )]
 async fn readiness_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let live = state.live.read().await;
+    readiness(&state.live).await
+}
+
+/// 200 once at least one cluster group has a built adapter; 503 before (for a worker,
+/// until its first config snapshot is active).
+pub(crate) async fn readiness(live: &tokio::sync::RwLock<LiveConfig>) -> Response {
+    let live = live.read().await;
     if live.adapters.is_empty() {
         return (StatusCode::SERVICE_UNAVAILABLE, "no adapters loaded").into_response();
     }
