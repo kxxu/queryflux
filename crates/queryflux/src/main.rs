@@ -1,18 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use queryflux_auth::{
-    AllowAllAuthorization, BackendIdentityResolver, LdapAuthProvider, NoneAuthProvider,
-    OidcAuthProvider, OpenFgaAuthorizationClient, SimpleAuthorizationPolicy, StaticAuthProvider,
-};
-use queryflux_cluster_manager::{
-    cluster_state::ClusterState, simple::SimpleClusterGroupManager, strategy::strategy_from_config,
-};
+use queryflux_auth::BackendIdentityResolver;
+use queryflux_cluster_manager::cluster_state::ClusterState;
 use queryflux_config::{yaml::YamlFileConfigProvider, ConfigProvider};
-use queryflux_core::query::{ClusterGroupName, ClusterName, EngineType};
+use queryflux_core::query::{ClusterGroupName, ClusterName};
 use queryflux_frontend::{
-    access_control_guard::OpaAccessGuard,
     admin::{
         build_frontends_status, AdminFrontend, RoutingConfigDto as AdminRoutingConfigDto,
         SecurityConfigDto as AdminSecurityConfigDto, TestCatalogProviderFn, TestClusterFn,
@@ -22,15 +16,8 @@ use queryflux_frontend::{
     mysql_wire::MysqlWireFrontend,
     postgres_wire::PostgresWireFrontend,
     snowflake::SnowflakeFrontend,
-    state::LiveConfig,
     trino_http::{state::AppState, TrinoHttpFrontend},
     FrontendListenerTrait,
-};
-use queryflux_guardrails::{
-    built_in::{Guard, ReadOnlyGuard, RequirePredicateGuard, RowLimitGuard},
-    config::FailBehavior,
-    external::{HttpWebhookGuard, MisconfiguredGuard, PythonScriptGuard},
-    GuardChain,
 };
 use queryflux_metrics::{
     buffered_store::BufferedMetricsStore, prometheus_store::PrometheusMetrics, MetricsStore,
@@ -38,21 +25,29 @@ use queryflux_metrics::{
 };
 use queryflux_persistence::{
     in_memory::InMemoryPersistence, postgres::PostgresStore, AdminStore, BackendStore,
-    DistributedBackendStore, KIND_GUARD,
-};
-use queryflux_routing::{
-    chain::RouterChain,
-    implementations::{
-        compound::CompoundRouter, header::HeaderRouter, protocol_based::ProtocolBasedRouter,
-        python_script::PythonScriptRouter, query_regex::QueryRegexRouter, tags::TagsRouter,
-        user_group::UserGroupRouter,
-    },
-    RouterTrait,
+    CoordinationStore, DistributedBackendStore,
 };
 use queryflux_translation::TranslationService;
 use tracing::info;
 
+mod config_source;
+mod guards;
+mod live_config;
 mod registered_engines;
+
+use crate::config_source::{
+    run_reload_loop, AdminStoreConfigSource, ConfigSource, LiveHandles, PostgresConfigSource,
+    ReloadTriggers,
+};
+use crate::guards::{
+    build_access_control_guard, build_auth_provider, build_authorization, build_guard_chains,
+    build_guard_chains_from_db_value, load_guard_script_bodies, operators_from_auth,
+    validate_group_translation_scripts,
+};
+use crate::live_config::{
+    cluster_configs_from_specs, compile_live_config, AdapterReloadCache, ClusterSpec, CompileMode,
+    ConfigIds, LiveConfigInputs,
+};
 
 type FrontendTaskResult = queryflux_core::error::Result<()>;
 
@@ -297,15 +292,17 @@ async fn main() -> Result<()> {
     let backend: Option<Arc<dyn BackendStore>> = pg_store.clone().map(|pg| pg as _);
     // Multi-replica coordination is optional: only backends that also implement
     // `DistributedBackendStore` (Postgres today) are stored here.
-    let distributed_backend: Option<Arc<dyn DistributedBackendStore>> = pg_store.map(|pg| pg as _);
+    let distributed_backend: Option<Arc<dyn DistributedBackendStore>> =
+        pg_store.clone().map(|pg| pg as _);
+    // The narrower view admission and the lease/reconcile/sweep tasks use: leases, sweep
+    // locks and published engine counts, without config or history storage.
+    let coordination: Option<Arc<dyn CoordinationStore>> = pg_store.map(|pg| pg as _);
 
     // Filled when Postgres loads cluster/group rows — used for query_history FKs on ClusterState.
     let mut cluster_ids_by_name: HashMap<String, i64> = HashMap::new();
     let mut group_ids_by_name: HashMap<String, i64> = HashMap::new();
-    // DB cluster records kept for adapter building via build_adapter_from_record.
-    let mut startup_cluster_records: Option<
-        Vec<queryflux_persistence::cluster_config::ClusterConfigRecord>,
-    > = None;
+    // Cluster specs loaded from Postgres; `None` for YAML-only startup.
+    let mut startup_cluster_specs: Option<Vec<ClusterSpec>> = None;
 
     // --- When Postgres is active, load cluster/group config from DB ---
     // Seed YAML `clusters` / `clusterGroups` only for names that are not already in
@@ -362,86 +359,14 @@ async fn main() -> Result<()> {
             .iter()
             .map(|r| (r.name.clone(), r.id))
             .collect();
-        // Build minimal ClusterConfig values for validation, group resolution, and
-        // `BackendIdentityResolver` (`queryAuth`). Adapters are still built from the
-        // raw JSONB via `build_adapter_from_record`.
-        let mut clusters: HashMap<String, queryflux_core::config::ClusterConfig> = HashMap::new();
-        for r in &db_cluster_records {
-            let engine = match queryflux_core::engine_registry::parse_engine_key(&r.engine_key) {
-                Ok(e) => e,
-                Err(err) => {
-                    tracing::warn!(cluster = %r.name, "skipping cluster: {err}");
-                    continue;
-                }
-            };
-            let query_auth =
-                match queryflux_core::engine_registry::parse_query_auth_from_config_json(&r.config)
-                {
-                    Ok(qa) => qa,
-                    Err(e) => {
-                        return Err(e).with_context(|| {
-                            format!("cluster '{}': invalid queryAuth in JSONB", r.name)
-                        });
-                    }
-                };
-            let auth = match queryflux_core::engine_registry::parse_auth_from_config_json(&r.config)
-            {
-                Ok(a) => a,
-                Err(e) => {
-                    tracing::warn!(
-                        cluster = %r.name,
-                        "invalid auth in cluster config JSON: {e}"
-                    );
-                    None
-                }
-            };
-            let max_running = max_running_queries_u64_from_db(&r.name, r.max_running_queries)?;
-            let base_cfg = queryflux_core::engine_registry::cluster_config_from_persisted_json(
-                engine.clone(),
-                r.enabled,
-                max_running,
-                &r.config,
-                auth.clone(),
-                query_auth.clone(),
-            );
-
-            // Expand variants: insert a ClusterConfig for each expanded name.
-            let variants = parse_cluster_variants(&r.variants);
-            if variants.is_empty() {
-                let mut base_cfg = base_cfg;
-                queryflux_core::config::apply_default_probe_queries(
-                    &mut base_cfg,
-                    &r.engine_key,
-                    &r.config,
-                );
-                clusters.insert(r.name.clone(), base_cfg);
-            } else {
-                match queryflux_core::config::expand_cluster_variants(
-                    &r.name,
-                    &r.config,
-                    &r.engine_key,
-                    &variants,
-                    base_cfg.health_check_query.as_deref(),
-                    base_cfg.reconcile_query.as_deref(),
-                ) {
-                    Ok(expanded) => {
-                        for exp in expanded {
-                            let mut variant_cfg = base_cfg.clone();
-                            variant_cfg.max_running_queries =
-                                exp.max_running_queries.or(max_running);
-                            variant_cfg.health_check_query = exp.health_check_query;
-                            variant_cfg.reconcile_query = exp.reconcile_query;
-                            clusters.insert(exp.expanded_name, variant_cfg);
-                        }
-                    }
-                    Err(err) => {
-                        tracing::error!(cluster = %r.name, error = %err, "Variant expansion failed — cluster omitted");
-                    }
-                }
-            }
-        }
-        config.clusters = clusters;
-        startup_cluster_records = Some(db_cluster_records);
+        // `ClusterConfig` values for validation, startup warnings and credential resolution.
+        // Adapters are built from the persisted JSON by `compile_live_config` below.
+        let specs: Vec<ClusterSpec> = db_cluster_records
+            .iter()
+            .map(ClusterSpec::from_record)
+            .collect();
+        config.clusters = cluster_configs_from_specs(&specs)?;
+        startup_cluster_specs = Some(specs);
 
         let group_records = pg
             .list_group_configs()
@@ -534,217 +459,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // --- Build cluster states and adapters (two-pass) ---
-    //
-    // Pass 1: iterate `config.clusters`, build one adapter per cluster name.
-    // Pass 2: iterate `config.cluster_groups`, resolve members, build ClusterStates.
-
-    type AdapterMap = HashMap<String, queryflux_engine_adapters::AdapterKind>;
-    let mut adapters: AdapterMap = HashMap::new();
-
-    // Pass 1 — one adapter per cluster (expanding variants for DB path).
-    // DB path: build from JSONB records directly; YAML path: build from ClusterConfig.
-    if let Some(records) = &startup_cluster_records {
-        for record in records {
-            if !record.enabled {
-                tracing::info!(cluster = %record.name, "Cluster disabled — skipping");
-                continue;
-            }
-
-            // Parse variants from the JSONB column.
-            let variants = parse_cluster_variants(&record.variants);
-            let (health_check_query, reconcile_query) = extract_base_probe_queries(&record.config);
-
-            if variants.is_empty() {
-                // No variants — build a single adapter as before.
-                let cluster_name = ClusterName(record.name.clone());
-                let placeholder_group = ClusterGroupName("_".to_string());
-                match registered_engines::build_adapter_from_record(
-                    cluster_name,
-                    placeholder_group,
-                    &record.engine_key,
-                    &record.config,
-                )
-                .await
-                {
-                    Ok(adapter) => {
-                        adapters.insert(record.name.clone(), adapter);
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            cluster = %record.name,
-                            error = %e,
-                            "Failed to build engine adapter — cluster omitted from routing until config or environment is fixed"
-                        );
-                    }
-                }
-            } else {
-                // Expand variants into independent runtime clusters.
-                let expanded = match queryflux_core::config::expand_cluster_variants(
-                    &record.name,
-                    &record.config,
-                    &record.engine_key,
-                    &variants,
-                    health_check_query.as_deref(),
-                    reconcile_query.as_deref(),
-                ) {
-                    Ok(e) => e,
-                    Err(err) => {
-                        tracing::error!(cluster = %record.name, error = %err, "Variant expansion failed — cluster omitted");
-                        continue;
-                    }
-                };
-                for exp in &expanded {
-                    // Map expanded name back to parent DB ID.
-                    cluster_ids_by_name.insert(exp.expanded_name.clone(), record.id);
-
-                    let cluster_name = ClusterName(exp.expanded_name.clone());
-                    let placeholder_group = ClusterGroupName("_".to_string());
-                    match registered_engines::build_adapter_from_record(
-                        cluster_name,
-                        placeholder_group,
-                        &record.engine_key,
-                        &exp.merged_config,
-                    )
-                    .await
-                    {
-                        Ok(adapter) => {
-                            adapters.insert(exp.expanded_name.clone(), adapter);
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                cluster = %exp.expanded_name,
-                                error = %e,
-                                "Failed to build engine adapter for variant — omitted"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        for (cluster_name_str, cluster_cfg) in &config.clusters {
-            if !cluster_cfg.enabled {
-                tracing::info!(cluster = %cluster_name_str, "Cluster disabled — skipping");
-                continue;
-            }
-            let cluster_name = ClusterName(cluster_name_str.clone());
-            let placeholder_group = ClusterGroupName("_".to_string());
-            match registered_engines::build_adapter(
-                cluster_name,
-                placeholder_group,
-                cluster_cfg,
-                cluster_name_str,
-            )
-            .await
-            {
-                Ok(adapter) => {
-                    adapters.insert(cluster_name_str.clone(), adapter);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        cluster = %cluster_name_str,
-                        error = %e,
-                        "Failed to build engine adapter — cluster omitted from routing until config or environment is fixed"
-                    );
-                }
-            }
-        }
-    }
-
-    // Pass 2 — one group entry per cluster_group, resolving member cluster names.
-    type GroupMap = HashMap<
-        ClusterGroupName,
-        (
-            Vec<Arc<ClusterState>>,
-            Arc<dyn queryflux_cluster_manager::strategy::ClusterSelectionStrategy>,
-        ),
-    >;
-    let mut group_states: GroupMap = HashMap::new();
-    let mut group_members: HashMap<String, Vec<String>> = HashMap::new();
-    let mut group_order: Vec<String> = Vec::new();
-
-    for (group_name, group_config) in &config.cluster_groups {
-        if !group_config.enabled {
-            tracing::info!(group = %group_name, "Cluster group disabled — skipping");
-            continue;
-        }
-        if let Some(breaker) = &group_config.circuit_breaker {
-            breaker
-                .validate()
-                .map_err(|e| anyhow::anyhow!("group '{group_name}': {e}"))?;
-        }
-        let group_key = ClusterGroupName(group_name.clone());
-        let mut states: Vec<Arc<ClusterState>> = Vec::new();
-        let mut seen_members: HashSet<&str> = HashSet::new();
-
-        for member_name in &group_config.members {
-            if !seen_members.insert(member_name.as_str()) {
-                tracing::warn!(
-                    group = %group_name,
-                    cluster = %member_name,
-                    "Duplicate cluster in group members list — ignoring extra entry"
-                );
-                continue;
-            }
-            let cluster_cfg = config.clusters.get(member_name).context(format!(
-                "group '{group_name}' references unknown cluster '{member_name}'"
-            ))?;
-
-            if !adapters.contains_key(member_name.as_str()) {
-                tracing::warn!(
-                    group = %group_name,
-                    cluster = %member_name,
-                    "Skipping cluster in group: disabled, or adapter failed to build at startup"
-                );
-                continue;
-            }
-
-            let engine = cluster_cfg
-                .engine
-                .as_ref()
-                .context(format!("cluster '{member_name}' missing engine"))?;
-            let engine_type = EngineType::from(engine);
-
-            let max_q = cluster_cfg
-                .max_running_queries
-                .unwrap_or(group_config.max_running_queries);
-            let cluster_cid = cluster_ids_by_name.get(member_name).copied();
-            let group_cid = group_ids_by_name.get(group_name.as_str()).copied();
-            let state = Arc::new(
-                ClusterState::new(
-                    ClusterName(member_name.clone()),
-                    group_key.clone(),
-                    cluster_cid,
-                    group_cid,
-                    engine_type,
-                    cluster_cfg.endpoint.clone(),
-                    max_q,
-                    cluster_cfg.enabled,
-                )
-                .with_circuit_breaker(group_config.circuit_breaker.clone(), None),
-            );
-            states.push(state);
-        }
-
-        let strategy = strategy_from_config(group_config.strategy.as_ref())
-            .context(format!("group '{group_name}' cluster-selection strategy"))?;
-        group_members.insert(group_name.clone(), group_config.members.clone());
-        group_order.push(group_name.clone());
-        group_states.insert(group_key, (states, strategy));
-    }
-    group_order.sort();
-
-    let health_check_targets = health_targets_from_groups(&group_states, &adapters);
-    let initial_strategies: HashMap<
-        String,
-        Arc<dyn queryflux_cluster_manager::strategy::ClusterSelectionStrategy>,
-    > = group_states
-        .iter()
-        .map(|(name, (_, strategy))| (name.0.clone(), strategy.clone()))
-        .collect();
-    let cluster_manager = Arc::new(SimpleClusterGroupManager::new(group_states));
-
     // --- Build translation service ---
     let translation = Arc::new(
         TranslationService::new_sqlglot(config.translation.python_scripts.clone())
@@ -768,89 +482,6 @@ async fn main() -> Result<()> {
     // (see `queryflux_catalog::build_catalog_provider`), same philosophy as `translation` above.
     let catalog: Arc<dyn queryflux_core::catalog::CatalogProvider> =
         queryflux_catalog::build_catalog_provider(&config.catalog_provider).await;
-
-    // --- Build router chain ---
-    let fallback = ClusterGroupName(config.routing_fallback.clone());
-    let mut routers: Vec<Box<dyn RouterTrait>> = Vec::new();
-
-    for router_cfg in &config.routers {
-        use queryflux_core::config::RouterConfig;
-        match router_cfg {
-            RouterConfig::ProtocolBased {
-                trino_http,
-                postgres_wire,
-                mysql_wire,
-                clickhouse_http,
-                flight_sql,
-                snowflake_http,
-                snowflake_sql_api,
-                mcp,
-            } => {
-                routers.push(Box::new(ProtocolBasedRouter {
-                    trino_http: trino_http.as_ref().map(|s| ClusterGroupName(s.clone())),
-                    postgres_wire: postgres_wire.as_ref().map(|s| ClusterGroupName(s.clone())),
-                    mysql_wire: mysql_wire.as_ref().map(|s| ClusterGroupName(s.clone())),
-                    clickhouse_http: clickhouse_http
-                        .as_ref()
-                        .map(|s| ClusterGroupName(s.clone())),
-                    flight_sql: flight_sql.as_ref().map(|s| ClusterGroupName(s.clone())),
-                    snowflake_http: snowflake_http.as_ref().map(|s| ClusterGroupName(s.clone())),
-                    snowflake_sql_api: snowflake_sql_api
-                        .as_ref()
-                        .map(|s| ClusterGroupName(s.clone())),
-                    mcp: mcp.as_ref().map(|s| ClusterGroupName(s.clone())),
-                }));
-            }
-            RouterConfig::Header {
-                header_name,
-                header_value_to_group,
-            } => {
-                let mapping = header_value_to_group
-                    .iter()
-                    .map(|(k, v)| (k.clone(), ClusterGroupName(v.clone())))
-                    .collect();
-                routers.push(Box::new(HeaderRouter::new(header_name.clone(), mapping)));
-            }
-            RouterConfig::UserGroup { user_to_group } => {
-                let mapping = user_to_group
-                    .iter()
-                    .map(|(k, v)| (k.clone(), ClusterGroupName(v.clone())))
-                    .collect();
-                routers.push(Box::new(UserGroupRouter::new(mapping)));
-            }
-            RouterConfig::QueryRegex { rules } => {
-                routers.push(Box::new(QueryRegexRouter::from_rules(rules.clone())));
-            }
-            RouterConfig::Tags { rules } => {
-                routers.push(Box::new(TagsRouter::new(rules.clone())));
-            }
-            RouterConfig::PythonScript {
-                script,
-                script_file,
-            } => {
-                let router = if let Some(path) = script_file {
-                    PythonScriptRouter::from_file(path)
-                        .context(format!("Failed to load routing script from {path}"))?
-                } else {
-                    PythonScriptRouter::new(script.clone())
-                };
-                routers.push(Box::new(router));
-            }
-            RouterConfig::Compound {
-                combine,
-                conditions,
-                target_group,
-            } => {
-                routers.push(Box::new(CompoundRouter::new(
-                    *combine,
-                    conditions.clone(),
-                    target_group.clone(),
-                )));
-            }
-        }
-    }
-
-    let router_chain = RouterChain::new(routers, fallback);
 
     config
         .validate_startup_security()
@@ -954,7 +585,6 @@ async fn main() -> Result<()> {
     }
 
     let identity_resolver = Arc::new(BackendIdentityResolver::new());
-    let cluster_configs = config.clusters.clone();
 
     let group_translation_scripts: HashMap<String, Vec<String>> = if let Some(pg) = &backend {
         let loaded = pg
@@ -988,162 +618,48 @@ async fn main() -> Result<()> {
         build_guard_chains(&config, &guard_script_bodies)
     };
 
-    // --- Startup validation: referential integrity of routing → groups → adapters ---
-    {
-        let issues = validate_live_config_refs(
-            &config.routers,
-            &config.routing_fallback,
-            &group_members,
-            &adapters,
-        );
-        if !issues.is_empty() {
-            for issue in &issues {
-                tracing::error!("Config validation: {issue}");
-            }
-            anyhow::bail!(
-                "Startup config has {} referential integrity error(s) — aborting",
-                issues.len()
-            );
-        }
-    }
-
-    // --- Wrap hot-reloadable fields in LiveConfig ---
-    let group_default_tags: HashMap<String, queryflux_core::tags::QueryTags> = config
-        .cluster_groups
-        .iter()
-        .filter(|(_, g)| !g.default_tags.is_empty())
-        .map(|(name, g)| (name.clone(), g.default_tags.clone()))
-        .collect();
-    let group_max_queued_queries: HashMap<String, Option<u64>> = config
-        .cluster_groups
-        .iter()
-        .filter(|(_, g)| g.max_queued_queries.is_some())
-        .map(|(name, g)| (name.clone(), g.max_queued_queries))
-        .collect();
-    let group_capacity_wait_timeout_secs: HashMap<String, u64> = config
-        .cluster_groups
-        .iter()
-        .map(|(name, g)| (name.clone(), g.capacity_wait_timeout_secs_or_default()))
-        .collect();
-    let group_cache_settings: HashMap<String, queryflux_core::config::GroupCacheConfig> = config
-        .cluster_groups
-        .iter()
-        .filter_map(|(name, g)| {
-            g.cache
-                .as_ref()
-                .filter(|c| c.enabled)
-                .map(|c| (name.clone(), c.clone()))
-        })
-        .collect();
-    // Build custom health/reconcile query maps from cluster configs.
-    let mut custom_health_queries: HashMap<String, String> = HashMap::new();
-    let mut custom_reconcile_queries: HashMap<String, String> = HashMap::new();
-    for (name, cfg) in &cluster_configs {
-        if let Some(q) = &cfg.health_check_query {
-            custom_health_queries.insert(name.clone(), q.clone());
-        }
-        if let Some(q) = &cfg.reconcile_query {
-            custom_reconcile_queries.insert(name.clone(), q.clone());
-        }
-    }
-
-    let live_config = LiveConfig {
-        router_chain,
-        guard_chain,
-        group_guard_chains,
-        access_control_guard,
-        cluster_manager,
-        adapters,
-        health_check_targets,
-        custom_health_queries,
-        custom_reconcile_queries,
-        cluster_configs,
-        group_members,
-        group_order,
+    // --- Compile the config into a LiveConfig (adapters, groups, routing, validation) ---
+    // Same compiler as hot reload, in strict mode: an unknown group member, a strategy
+    // that fails to build, an unreadable routing script or a dangling reference aborts
+    // startup.
+    let inputs = LiveConfigInputs {
+        clusters: startup_cluster_specs.unwrap_or_else(|| {
+            config
+                .clusters
+                .iter()
+                .map(|(name, cfg)| ClusterSpec::from_yaml(name, cfg))
+                .collect()
+        }),
+        groups: config.cluster_groups.clone(),
+        routers: config.routers.clone(),
+        routing_fallback: config.routing_fallback.clone(),
         group_translation_scripts,
-        group_default_tags,
-        group_max_queued_queries,
-        group_capacity_wait_timeout_secs,
-        group_cache_settings,
-        auth_provider,
-        authorization,
-        catalog,
+        // Startup applies settings itself (YAML with DB overrides, below and above).
+        settings: Default::default(),
     };
-    // Seed the reload cache. When Postgres is active, fingerprint `engine_key` + JSONB config
-    // (same format as `build_live_config` on reload) so an engine change rebuilds adapters even
-    // when the config blob shape is unchanged. For YAML-only, fold canonical `engine_key` + `ClusterConfig`.
-    let initial_config_json: HashMap<String, String> = if let Some(records) =
-        &startup_cluster_records
-    {
-        let mut m: HashMap<String, String> = HashMap::new();
-        for r in records {
-            let variants = parse_cluster_variants(&r.variants);
-            if variants.is_empty() {
-                m.insert(
-                    r.name.clone(),
-                    serde_json::to_string(&(r.engine_key.as_str(), &r.config)).unwrap_or_default(),
-                );
-            } else {
-                let (health_check_query, reconcile_query) = extract_base_probe_queries(&r.config);
-                match queryflux_core::config::expand_cluster_variants(
-                    &r.name,
-                    &r.config,
-                    &r.engine_key,
-                    &variants,
-                    health_check_query.as_deref(),
-                    reconcile_query.as_deref(),
-                ) {
-                    Ok(expanded) => {
-                        for exp in expanded {
-                            m.insert(
-                                exp.expanded_name,
-                                serde_json::to_string(&(r.engine_key.as_str(), &exp.merged_config))
-                                    .unwrap_or_default(),
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        tracing::error!(cluster = %r.name, error = %err, "Variant expansion failed — cluster omitted");
-                    }
-                }
-            }
-        }
-        m
-    } else {
-        live_config
-            .cluster_configs
-            .iter()
-            .map(|(k, v)| {
-                let ek = v
-                    .engine
-                    .as_ref()
-                    .map(queryflux_core::engine_registry::engine_key)
-                    .unwrap_or("");
-                (
-                    k.clone(),
-                    serde_json::to_string(&(ek, v)).unwrap_or_default(),
-                )
-            })
-            .collect()
+    let ids = ConfigIds {
+        clusters: cluster_ids_by_name,
+        groups: group_ids_by_name,
     };
-    let adapter_reload_cache = Arc::new(tokio::sync::Mutex::new(AdapterReloadCache {
-        adapters: live_config.adapters.clone(),
-        config_json: initial_config_json,
-        // Seed with the initial cluster states so the first reload can inherit health status.
-        cluster_states: live_config
-            .health_check_targets
-            .iter()
-            .map(|(_, s)| {
-                (
-                    (s.group_name.0.clone(), s.cluster_name.0.clone()),
-                    s.clone(),
-                )
-            })
-            .collect(),
+    let mut reload_cache = AdapterReloadCache {
+        adapters: HashMap::new(),
+        config_json: HashMap::new(),
+        cluster_states: HashMap::new(),
         routing_fallback: config.routing_fallback.clone(),
         routers_cfg: config.routers.clone(),
-        strategies: initial_strategies,
-    }));
+        strategies: HashMap::new(),
+    };
+    let mut live_config =
+        compile_live_config(&inputs, &ids, &mut reload_cache, CompileMode::Strict)
+            .await
+            .context("Startup config is invalid — aborting")?;
+    live_config.guard_chain = guard_chain;
+    live_config.group_guard_chains = group_guard_chains;
+    live_config.access_control_guard = access_control_guard;
+    live_config.auth_provider = auth_provider;
+    live_config.authorization = authorization;
+    live_config.catalog = catalog;
+    let adapter_reload_cache = Arc::new(tokio::sync::Mutex::new(reload_cache));
     let live = Arc::new(tokio::sync::RwLock::new(live_config));
 
     // Replica identity for capacity leases and queue claims. Must be unique per
@@ -1168,7 +684,7 @@ async fn main() -> Result<()> {
     let distributed = config
         .queryflux
         .resolve_distributed(
-            distributed_backend
+            coordination
                 .as_ref()
                 .is_some_and(|b| b.supports_distributed_coordination()),
         )
@@ -1185,7 +701,7 @@ async fn main() -> Result<()> {
 
     let capacity_store: Option<Arc<dyn queryflux_persistence::CapacityStore>> = distributed
         .then(|| {
-            distributed_backend
+            coordination
                 .clone()
                 .map(|b| b as Arc<dyn queryflux_persistence::CapacityStore>)
         })
@@ -1441,7 +957,7 @@ async fn main() -> Result<()> {
         let state = app_state.clone();
         let prometheus = prometheus.clone();
         let backend = backend.clone();
-        let distributed_backend = distributed_backend.clone();
+        let coordination = coordination.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -1471,7 +987,7 @@ async fn main() -> Result<()> {
                 prometheus.sync_circuit_breaker_states(&breaker_states);
                 let mut records = Vec::with_capacity(snapshots.len());
                 for snap in snapshots {
-                    let global_running = if let Some(db) = &distributed_backend {
+                    let global_running = if let Some(db) = &coordination {
                         let store = db.clone() as Arc<dyn queryflux_persistence::CapacityStore>;
                         store
                             .active_count(&snap.cluster_name.0)
@@ -1498,7 +1014,7 @@ async fn main() -> Result<()> {
                 // coordination failure fails open (duplicate rows beat no rows).
                 // A non-coordinating backend persists unconditionally — it
                 // cannot dedup across replicas anyway.
-                let lock = match &distributed_backend {
+                let lock = match &coordination {
                     Some(db) => match db.try_sweep_lock("cluster-snapshots").await {
                         Ok(Some(lock)) => Some(Some(lock)),
                         Ok(None) => None, // another replica persists this cycle
@@ -1551,7 +1067,7 @@ async fn main() -> Result<()> {
     // Also expires stale capacity leases from crashed replicas.
     tokio::spawn({
         let state = app_state.clone();
-        let distributed_backend = distributed_backend.clone();
+        let coordination = coordination.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         async move {
             const CLIENT_TIMEOUT_SECS: i64 = 300; // matches Trino's query.client.timeout default
@@ -1566,7 +1082,7 @@ async fn main() -> Result<()> {
                 // holding the advisory lock runs them this cycle. A crashed owner's
                 // lock is released with its connection, so another replica takes
                 // over on its next tick. On lock errors, fail open and sweep anyway.
-                let sweep_lock = match &distributed_backend {
+                let sweep_lock = match &coordination {
                     Some(backend) => match backend.try_sweep_lock("zombie-eviction").await {
                         Ok(Some(lock)) => Some(lock),
                         Ok(None) => continue, // another replica owns this cycle
@@ -1662,7 +1178,7 @@ async fn main() -> Result<()> {
     // deletes queued entries not accessed for > 5 minutes.
     tokio::spawn({
         let state = app_state.clone();
-        let distributed_backend = distributed_backend.clone();
+        let coordination = coordination.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         async move {
             const CLIENT_TIMEOUT_SECS: i64 = 300;
@@ -1672,7 +1188,7 @@ async fn main() -> Result<()> {
                     break;
                 }
 
-                let sweep_lock = match &distributed_backend {
+                let sweep_lock = match &coordination {
                     Some(backend) => match backend.try_sweep_lock("stale-queued-eviction").await {
                         Ok(Some(lock)) => Some(lock),
                         Ok(None) => continue,
@@ -1778,26 +1294,12 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Background task: hot-reload routing rules + cluster configs from the DB when:
-    //   1. Another replica bumps the config revision (distributed LISTEN/NOTIFY via ConfigRevisionStore)
-    //   2. This replica's admin API writes config (local tokio::sync::Notify fast-path)
-    //   3. A periodic timer fires (safety-net polling, configurable via configReloadIntervalSecs)
-    //
-    // When no durable backend is configured, only local Notify triggers guard-chain reloads.
-    tokio::spawn({
-        let live = live.clone();
-        let backend = backend.clone();
-        let cache = adapter_reload_cache.clone();
-        let notify = config_reload_notify.clone();
-        let admin_for_reload = admin_store_for_reload;
-        let metrics = app_state.metrics.clone();
-        let periodic_secs = config.queryflux.periodic_config_reload_interval_secs();
-        let mut shutdown_rx = shutdown_rx.clone();
-
-        // Subscribe to distributed config revision changes (push where the
-        // backend supports it, e.g. Postgres LISTEN/NOTIFY).
-        let revision_rx = if let Some(backend) = &backend {
-            match backend.subscribe_revisions().await {
+    // Background task: hot-reload config. The source decides when (admin writes on this
+    // replica, revision changes from other replicas, a periodic safety-net timer) and how
+    // (Postgres rows, or in YAML mode only the settings stored through the admin API).
+    {
+        let revisions = match &backend {
+            Some(backend) => match backend.subscribe_revisions().await {
                 Ok(Some(rx)) => {
                     tracing::info!("Subscribed to backend config revision notifications");
                     Some(rx)
@@ -1807,215 +1309,29 @@ async fn main() -> Result<()> {
                     tracing::warn!("Failed to subscribe to config revision notifications: {e}");
                     None
                 }
-            }
-        } else {
-            None
+            },
+            None => None,
         };
-
-        async move {
-            async fn do_reload(
-                backend: &Arc<dyn BackendStore>,
-                cache: &tokio::sync::Mutex<AdapterReloadCache>,
-                live: &Arc<tokio::sync::RwLock<LiveConfig>>,
-                metrics: &Arc<dyn MetricsStore>,
-            ) {
-                let mut cache_guard = cache.lock().await;
-                // Snapshot the pieces a reload must never silently weaken; the
-                // read guard is dropped before the write below.
-                let prev = {
-                    let l = live.read().await;
-                    PreservedLive {
-                        auth_provider: l.auth_provider.clone(),
-                        authorization: l.authorization.clone(),
-                        guard_chain: l.guard_chain.clone(),
-                        group_guard_chains: l.group_guard_chains.clone(),
-                        access_control_guard: l.access_control_guard.clone(),
-                        catalog: l.catalog.clone(),
-                    }
-                };
-                // A rejected reload must not change the adapter/state cache that
-                // the next attempt uses to preserve the currently live breakers.
-                let mut candidate_cache = cache_guard.clone();
-                match reload_live_config(backend, &mut candidate_cache, &prev, metrics).await {
-                    Ok(new_live) => {
-                        let mut live_guard = live.write().await;
-                        *cache_guard = candidate_cache;
-                        *live_guard = new_live;
-                        tracing::info!("Live config reloaded from backend");
-                    }
-                    Err(e) => {
-                        metrics.on_config_reload_failure("reload");
-                        tracing::warn!("Config reload failed: {e}");
-                    }
-                }
-            }
-
-            async fn reload_guard_chain_from_admin(
-                admin: &Option<Arc<dyn AdminStore>>,
-                live: &Arc<tokio::sync::RwLock<LiveConfig>>,
-                metrics: &Arc<dyn MetricsStore>,
-            ) {
-                if let Some(store) = admin {
-                    let guard_script_bodies =
-                        load_guard_script_bodies_from_admin(store.as_ref()).await;
-                    match store.get_proxy_setting("guardrails_config").await {
-                        Ok(Some(v)) => {
-                            let (global, groups) =
-                                build_guard_chains_from_db_value(&v, &guard_script_bodies);
-                            let mut w = live.write().await;
-                            w.guard_chain = global;
-                            w.group_guard_chains = groups;
-                        }
-                        Ok(None) => {
-                            let mut w = live.write().await;
-                            w.guard_chain = None;
-                            w.group_guard_chains = HashMap::new();
-                        }
-                        Err(e) => {
-                            metrics.on_config_reload_failure("guard_reload");
-                            tracing::warn!("Guard chain reload failed: {e}");
-                        }
-                    }
-                    // Catalog provider: same admin-store-only reload contract as guard
-                    // chains above — a `Null` provider is always a safe fallback (schema-aware
-                    // translation just degrades to dialect-only), unlike auth/authz.
-                    match store.get_proxy_setting("catalog_config").await {
-                        Ok(Some(v)) => {
-                            match serde_json::from_value::<
-                                queryflux_core::config::CatalogProviderConfig,
-                            >(v)
-                            {
-                                Ok(cfg) => {
-                                    let provider =
-                                        queryflux_catalog::build_catalog_provider(&cfg).await;
-                                    live.write().await.catalog = provider;
-                                }
-                                Err(e) => {
-                                    metrics.on_config_reload_failure("catalog_reload");
-                                    tracing::warn!("Catalog config parse failed: {e}");
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            live.write().await.catalog =
-                                Arc::new(queryflux_core::catalog::NullCatalogProvider);
-                        }
-                        Err(e) => {
-                            metrics.on_config_reload_failure("catalog_reload");
-                            tracing::warn!("Catalog config reload failed: {e}");
-                        }
-                    }
-                    match store.get_proxy_setting("access_control_config").await {
-                        Ok(Some(v)) => match apply_stored_access_control(&v) {
-                            Ok(guard) => {
-                                live.write().await.access_control_guard = guard;
-                            }
-                            Err(e) => {
-                                metrics.on_config_reload_failure("access_control_reload");
-                                tracing::warn!("Access control config parse/build failed: {e}");
-                            }
-                        },
-                        Ok(None) => {}
-                        Err(e) => {
-                            metrics.on_config_reload_failure("access_control_reload");
-                            tracing::warn!("Access control config reload failed: {e}");
-                        }
-                    }
-                }
-            }
-
-            async fn do_reload_or_guard(
-                backend: &Option<Arc<dyn BackendStore>>,
-                cache: &tokio::sync::Mutex<AdapterReloadCache>,
-                live: &Arc<tokio::sync::RwLock<LiveConfig>>,
-                admin: &Option<Arc<dyn AdminStore>>,
-                metrics: &Arc<dyn MetricsStore>,
-            ) {
-                if let Some(backend) = backend {
-                    do_reload(backend, cache, live, metrics).await;
-                } else {
-                    // YAML-mode reload contract: without a Postgres backend, routing rules,
-                    // cluster configs, and adapters are fixed at startup from the YAML file
-                    // and cannot change at runtime. Only guard chains (stored in the admin
-                    // store) can be hot-reloaded via the admin API. Routing or cluster
-                    // changes in YAML require a process restart.
-                    reload_guard_chain_from_admin(admin, live, metrics).await;
-                }
-            }
-
-            // Wrap the optional receiver so we can always select on it.
-            let mut revision_rx = revision_rx;
-
-            // Coalesce notification bursts: a bulk admin save bumps the revision
-            // once per write, and each bump is one channel message — without
-            // draining, N rapid writes would trigger N full reloads (adapter
-            // rebuilds included) on every replica. A short settle window lets
-            // writes a few hundred ms apart collapse into one reload too.
-            async fn coalesce_revisions(rx: &mut Option<tokio::sync::mpsc::Receiver<u64>>) {
-                if let Some(rx) = rx.as_mut() {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    while rx.try_recv().is_ok() {}
-                }
-            }
-
-            // A future that resolves when the revision receiver gets a message,
-            // or pends forever if there is no receiver. A closed channel (the
-            // LISTEN/NOTIFY task died) drops the receiver so we don't spin on
-            // an immediately-ready `recv()`; periodic polling remains the
-            // safety net for config propagation.
-            async fn recv_revision(rx: &mut Option<tokio::sync::mpsc::Receiver<u64>>) -> u64 {
-                match rx {
-                    Some(r) => match r.recv().await {
-                        Some(rev) => rev,
-                        None => {
-                            tracing::warn!(
-                                "Config revision channel closed — falling back to periodic polling"
-                            );
-                            *rx = None;
-                            std::future::pending().await
-                        }
-                    },
-                    None => std::future::pending().await,
-                }
-            }
-
-            match periodic_secs {
-                None => loop {
-                    tokio::select! {
-                        _ = shutdown_rx.wait_for(|v| *v) => break,
-                        _ = notify.notified() => {
-                            tracing::debug!("Config reload triggered by local admin write");
-                        }
-                        rev = recv_revision(&mut revision_rx) => {
-                            tracing::debug!(revision = rev, "Config reload triggered by distributed revision change");
-                        }
-                    }
-                    coalesce_revisions(&mut revision_rx).await;
-                    do_reload_or_guard(&backend, &cache, &live, &admin_for_reload, &metrics).await;
-                },
-                Some(interval_secs) => {
-                    let mut interval =
-                        tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-                    interval.tick().await; // skip the first immediate tick — startup already loaded
-                    loop {
-                        tokio::select! {
-                            _ = shutdown_rx.wait_for(|v| *v) => break,
-                            _ = interval.tick() => {}
-                            _ = notify.notified() => {
-                                tracing::debug!("Config reload triggered by local admin write");
-                            }
-                            rev = recv_revision(&mut revision_rx) => {
-                                tracing::debug!(revision = rev, "Config reload triggered by distributed revision change");
-                            }
-                        }
-                        coalesce_revisions(&mut revision_rx).await;
-                        do_reload_or_guard(&backend, &cache, &live, &admin_for_reload, &metrics)
-                            .await;
-                    }
-                }
-            }
-        }
-    });
+        let triggers = ReloadTriggers::new(
+            config_reload_notify.clone(),
+            revisions,
+            config.queryflux.periodic_config_reload_interval_secs(),
+        )
+        .await;
+        let source: Box<dyn ConfigSource> = match &backend {
+            Some(backend) => Box::new(PostgresConfigSource::new(backend.clone(), triggers)),
+            None => Box::new(AdminStoreConfigSource::new(
+                admin_store_for_reload,
+                triggers,
+            )),
+        };
+        let handles = LiveHandles {
+            live: live.clone(),
+            cache: adapter_reload_cache.clone(),
+            metrics: app_state.metrics.clone(),
+        };
+        tokio::spawn(run_reload_loop(source, handles, shutdown_rx.clone()));
+    }
 
     // Background task: health-check each cluster every 30s via its adapter.
     // Clusters with a custom `healthCheckQuery` use that SQL instead of `SELECT 1`.
@@ -2079,7 +1395,7 @@ async fn main() -> Result<()> {
     // queries backends; it publishes counts to Postgres and other replicas sync locally.
     tokio::spawn({
         let state = app_state.clone();
-        let distributed_backend = distributed_backend.clone();
+        let coordination = coordination.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -2096,7 +1412,7 @@ async fn main() -> Result<()> {
                 };
                 let targets = reconcile_targets_from_health_targets(&targets);
 
-                if let Some(ref db) = distributed_backend {
+                if let Some(ref db) = coordination {
                     let capacity_store =
                         db.clone() as Arc<dyn queryflux_persistence::CapacityStore>;
                     match db.try_sweep_lock("engine-reconcile").await {
@@ -2368,14 +1684,6 @@ async fn main() -> Result<()> {
 // Hot-reload helpers
 // ---------------------------------------------------------------------------
 
-type GroupStatesMap = HashMap<
-    ClusterGroupName,
-    (
-        Vec<Arc<ClusterState>>,
-        Arc<dyn queryflux_cluster_manager::strategy::ClusterSelectionStrategy>,
-    ),
->;
-
 /// Clusters with `queryAuth: passthrough` when `authorization.provider` is `none` — the
 /// gateway enforces no access policy, so a client's own credential decides what it can
 /// reach. Returned regardless of `cluster_groups.len()`: a single-group deployment (the
@@ -2412,71 +1720,6 @@ fn unauthenticated_passthrough_clusters(
         .collect()
 }
 
-/// Parses the `variants` JSONB column into `ClusterVariant`s. Shared by every
-/// startup/reload path that expands a persisted cluster record into runtime
-/// clusters, so the parsing behavior (and its `unwrap_or_default` on malformed
-/// JSON) stays identical everywhere instead of drifting across call sites.
-fn parse_cluster_variants(
-    variants_json: &serde_json::Value,
-) -> Vec<queryflux_core::config::ClusterVariant> {
-    serde_json::from_value(variants_json.clone()).unwrap_or_default()
-}
-
-/// Extracts the base `healthCheckQuery` / `reconcileQuery` overrides from a
-/// cluster's persisted `config` JSONB blob, ahead of variant expansion (which
-/// applies driver defaults and `{{sub_resource}}` substitution on top). Shared
-/// by every call site that needs these two fields before calling
-/// `expand_cluster_variants`.
-fn extract_base_probe_queries(config_json: &serde_json::Value) -> (Option<String>, Option<String>) {
-    let health_check_query = config_json
-        .get("healthCheckQuery")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let reconcile_query = config_json
-        .get("reconcileQuery")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    (health_check_query, reconcile_query)
-}
-
-/// Convert optional Postgres `BIGINT` (`max_running_queries`) to `Option<u64>`.
-/// Negative values fail fast (invalid row).
-fn max_running_queries_u64_from_db(cluster: &str, v: Option<i64>) -> Result<Option<u64>> {
-    match v {
-        None => Ok(None),
-        Some(n) => u64::try_from(n).map(Some).map_err(|_| {
-            anyhow::anyhow!(
-                "cluster '{cluster}': max_running_queries must be non-negative (got {n})"
-            )
-        }),
-    }
-}
-
-/// Holds adapter instances between DB reloads. Adapters are recreated when the
-/// reload fingerprint changes (`engine_key` + config JSON), so engine switches and
-/// endpoint/credential updates rebuild adapters.
-#[derive(Clone)]
-struct AdapterReloadCache {
-    adapters: HashMap<String, queryflux_engine_adapters::AdapterKind>,
-    config_json: HashMap<String, String>,
-    /// Previous-generation cluster states keyed by (group, cluster).
-    /// Preserved across reloads so that health status and running-query counters
-    /// are not reset to their initial values every time the config is reloaded.
-    cluster_states: HashMap<(String, String), Arc<ClusterState>>,
-    /// Last-known routing from DB (or YAML at startup). Used when `load_routing_config` returns
-    /// `Ok(None)` so periodic reload does not wipe routing.
-    routing_fallback: String,
-    routers_cfg: Vec<queryflux_core::config::RouterConfig>,
-    /// Last-successfully-built cluster-selection strategy per group, keyed by group name.
-    /// Consulted when a reload's `strategy_from_config` fails (e.g. a `pythonScript` group's
-    /// `scriptFile` becomes transiently unreadable) so that group keeps its real strategy
-    /// (weighting, engine affinity, …) instead of silently degrading to round robin. Only
-    /// updated on a successful build, so it always reflects the last *good* strategy, not
-    /// whatever fallback got substituted on a prior failed reload.
-    strategies:
-        HashMap<String, Arc<dyn queryflux_cluster_manager::strategy::ClusterSelectionStrategy>>,
-}
-
 /// A cancelled health-check future must not leave its member HalfOpen forever.
 struct BreakerProbeGuard {
     state: Arc<ClusterState>,
@@ -2511,27 +1754,6 @@ impl Drop for BreakerProbeGuard {
     }
 }
 
-fn health_targets_from_groups(
-    group_states: &GroupStatesMap,
-    adapters: &HashMap<String, queryflux_engine_adapters::AdapterKind>,
-) -> Vec<(queryflux_engine_adapters::AdapterKind, Arc<ClusterState>)> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for (states, _) in group_states.values() {
-        for state in states {
-            let name = state.cluster_name.0.clone();
-            // The same backend may be a member of several groups, each with an
-            // independent breaker that needs its own half-open probe.
-            if seen.insert((state.group_name.0.clone(), name.clone())) {
-                if let Some(adapter) = adapters.get(&name) {
-                    out.push((adapter.clone(), state.clone()));
-                }
-            }
-        }
-    }
-    out
-}
-
 /// Health probes are per group/member; engine reconciliation is per backend.
 /// Keep every member state so the single fetched count reaches all groups.
 fn reconcile_targets_from_health_targets<A: Clone>(
@@ -2549,1441 +1771,6 @@ fn reconcile_targets_from_health_targets<A: Clone>(
         }
     }
     grouped
-}
-
-/// Validate referential integrity of a config that is about to go live.
-///
-/// Returns a list of human-readable issue strings (empty = valid). Callers should
-/// treat any non-empty return as a fatal config error and keep the previous LiveConfig.
-///
-/// Checks:
-///  - `routing_fallback` names a group that exists in `group_members`.
-///  - Every static `target_group` reference in `routers_cfg` names a group in `group_members`.
-///    (PythonScript routers are skipped — their target group is computed at runtime.)
-///  - Every cluster name listed in `group_members` has a built adapter in `adapters`.
-fn validate_live_config_refs(
-    routers_cfg: &[queryflux_core::config::RouterConfig],
-    routing_fallback: &str,
-    group_members: &HashMap<String, Vec<String>>,
-    adapters: &HashMap<String, queryflux_engine_adapters::AdapterKind>,
-) -> Vec<String> {
-    use queryflux_core::config::RouterConfig;
-
-    let mut issues: Vec<String> = Vec::new();
-
-    if !group_members.contains_key(routing_fallback) {
-        issues.push(format!(
-            "routing_fallback references unknown group '{routing_fallback}'"
-        ));
-    }
-
-    for router in routers_cfg {
-        let mut refs: Vec<&str> = Vec::new();
-        match router {
-            RouterConfig::ProtocolBased {
-                trino_http,
-                postgres_wire,
-                mysql_wire,
-                clickhouse_http,
-                flight_sql,
-                snowflake_http,
-                snowflake_sql_api,
-                mcp,
-            } => {
-                let opts: [Option<&str>; 8] = [
-                    trino_http.as_deref(),
-                    postgres_wire.as_deref(),
-                    mysql_wire.as_deref(),
-                    clickhouse_http.as_deref(),
-                    flight_sql.as_deref(),
-                    snowflake_http.as_deref(),
-                    snowflake_sql_api.as_deref(),
-                    mcp.as_deref(),
-                ];
-                refs.extend(opts.into_iter().flatten());
-            }
-            RouterConfig::Header {
-                header_value_to_group,
-                ..
-            } => {
-                refs.extend(header_value_to_group.values().map(String::as_str));
-            }
-            RouterConfig::UserGroup { user_to_group } => {
-                refs.extend(user_to_group.values().map(String::as_str));
-            }
-            RouterConfig::QueryRegex { rules } => {
-                for rule in rules {
-                    if matches!(rule.action, queryflux_core::config::RegexRouteAction::Route) {
-                        if let Some(group) = rule.target_group.as_deref() {
-                            refs.push(group);
-                        } else {
-                            issues.push("queryRegex route rule requires targetGroup".to_string());
-                        }
-                    }
-                }
-            }
-            RouterConfig::Tags { rules } => {
-                refs.extend(rules.iter().map(|r| r.target_group.as_str()));
-            }
-            RouterConfig::Compound { target_group, .. } => {
-                refs.push(target_group.as_str());
-            }
-            RouterConfig::PythonScript { .. } => {}
-        }
-        for group in refs {
-            if !group_members.contains_key(group) {
-                issues.push(format!("router references unknown group '{group}'"));
-            }
-        }
-    }
-
-    for (group, members) in group_members {
-        for member in members {
-            if !adapters.contains_key(member.as_str()) {
-                issues.push(format!(
-                    "group '{group}' member '{member}' has no built adapter"
-                ));
-            }
-        }
-    }
-
-    issues
-}
-
-/// Per expanded variant: merged JSON config, optional max concurrency, optional probe SQL.
-type ExpandedVariantConfig = (
-    serde_json::Value,
-    Option<u64>,
-    Option<String>,
-    Option<String>,
-);
-
-/// Build a `LiveConfig` from DB cluster records, group maps, and router chain components.
-///
-/// This is the DB load path: adapters are built directly from the JSONB config blob
-/// in each `ClusterConfigRecord`, bypassing the `ClusterConfig` god struct.
-///
-/// `cache` holds adapter instances from the previous generation. Adapters are reused
-/// only when the fingerprint of `engine_key` + JSONB config matches the previous reload;
-/// otherwise they are rebuilt (e.g. engine switch, endpoint, or password changed).
-#[allow(clippy::too_many_arguments)]
-async fn build_live_config(
-    cluster_records: &[queryflux_persistence::cluster_config::ClusterConfigRecord],
-    cluster_groups: &std::collections::HashMap<String, queryflux_core::config::ClusterGroupConfig>,
-    cluster_ids_by_name: &HashMap<String, i64>,
-    group_ids_by_name: &HashMap<String, i64>,
-    routers_cfg: &[queryflux_core::config::RouterConfig],
-    routing_fallback: &str,
-    group_translation_scripts: HashMap<String, Vec<String>>,
-    cache: &mut AdapterReloadCache,
-) -> Result<LiveConfig> {
-    use queryflux_cluster_manager::{
-        cluster_state::ClusterState,
-        simple::SimpleClusterGroupManager,
-        strategy::{strategy_from_config, RoundRobinStrategy},
-    };
-    use queryflux_core::config::apply_default_probe_queries;
-    use queryflux_core::engine_registry::{
-        cluster_config_from_persisted_json, json_str, parse_auth_from_config_json,
-        parse_engine_key, parse_query_auth_from_config_json,
-    };
-    use queryflux_core::tags::QueryTags;
-
-    // Build a lookup map from records for group member resolution.
-    // This includes both base record names and expanded variant names.
-    let records_by_name: HashMap<
-        &str,
-        &queryflux_persistence::cluster_config::ClusterConfigRecord,
-    > = cluster_records
-        .iter()
-        .map(|r| (r.name.as_str(), r))
-        .collect();
-
-    // Expand variants: build a map of all valid cluster names (base + expanded).
-    let mut all_cluster_names: HashSet<String> = HashSet::new();
-    // Track which expanded names map to which parent record (for records_by_name resolution).
-    let mut expanded_to_parent: HashMap<
-        String,
-        &queryflux_persistence::cluster_config::ClusterConfigRecord,
-    > = HashMap::new();
-    // Track expanded cluster configs for each variant.
-    let mut expanded_configs: HashMap<String, ExpandedVariantConfig> = HashMap::new();
-
-    for record in cluster_records {
-        let variants = parse_cluster_variants(&record.variants);
-
-        if variants.is_empty() {
-            all_cluster_names.insert(record.name.clone());
-        } else {
-            let (health_check_query, reconcile_query) = extract_base_probe_queries(&record.config);
-            match queryflux_core::config::expand_cluster_variants(
-                &record.name,
-                &record.config,
-                &record.engine_key,
-                &variants,
-                health_check_query.as_deref(),
-                reconcile_query.as_deref(),
-            ) {
-                Ok(expanded) => {
-                    for exp in expanded {
-                        all_cluster_names.insert(exp.expanded_name.clone());
-                        expanded_to_parent.insert(exp.expanded_name.clone(), record);
-                        expanded_configs.insert(
-                            exp.expanded_name,
-                            (
-                                exp.merged_config,
-                                exp.max_running_queries,
-                                exp.health_check_query,
-                                exp.reconcile_query,
-                            ),
-                        );
-                    }
-                }
-                Err(err) => {
-                    tracing::error!(cluster = %record.name, error = %err, "Reload: variant expansion failed — cluster omitted");
-                }
-            }
-        }
-    }
-
-    let prev_config_json = cache.config_json.clone();
-
-    // Build adapters — reuse when serialized cluster config is unchanged.
-    // First handle base (non-variant) records.
-    for record in cluster_records {
-        if !parse_cluster_variants(&record.variants).is_empty() {
-            continue; // has variants — handled below
-        }
-
-        let cluster_name_str = &record.name;
-        if !record.enabled {
-            cache.adapters.remove(cluster_name_str.as_str());
-            cache.config_json.remove(cluster_name_str.as_str());
-            continue;
-        }
-        let cfg_json = serde_json::to_string(&(record.engine_key.as_str(), &record.config))
-            .unwrap_or_default();
-        let reuse = cache.adapters.contains_key(cluster_name_str.as_str())
-            && prev_config_json
-                .get(cluster_name_str.as_str())
-                .map(String::as_str)
-                == Some(cfg_json.as_str());
-        if reuse {
-            continue;
-        }
-        cache.adapters.remove(cluster_name_str.as_str());
-        cache.config_json.remove(cluster_name_str.as_str());
-
-        let cluster_name = ClusterName(cluster_name_str.clone());
-        let placeholder_group = ClusterGroupName("_".to_string());
-        let adapter = match registered_engines::build_adapter_from_record(
-            cluster_name,
-            placeholder_group,
-            &record.engine_key,
-            &record.config,
-        )
-        .await
-        {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::error!(
-                    cluster = %cluster_name_str,
-                    error = %e,
-                    "Reload: failed to build engine adapter — cluster omitted until fixed"
-                );
-                continue;
-            }
-        };
-        cache.adapters.insert(cluster_name_str.clone(), adapter);
-        cache.config_json.insert(cluster_name_str.clone(), cfg_json);
-    }
-
-    // Build adapters for expanded variant clusters.
-    for (expanded_name, (merged_config, _, _, _)) in &expanded_configs {
-        let parent = match expanded_to_parent.get(expanded_name) {
-            Some(p) => p,
-            None => continue,
-        };
-        if !parent.enabled {
-            cache.adapters.remove(expanded_name.as_str());
-            cache.config_json.remove(expanded_name.as_str());
-            continue;
-        }
-        let cfg_json =
-            serde_json::to_string(&(parent.engine_key.as_str(), merged_config)).unwrap_or_default();
-        let reuse = cache.adapters.contains_key(expanded_name.as_str())
-            && prev_config_json
-                .get(expanded_name.as_str())
-                .map(String::as_str)
-                == Some(cfg_json.as_str());
-        if reuse {
-            continue;
-        }
-        cache.adapters.remove(expanded_name.as_str());
-        cache.config_json.remove(expanded_name.as_str());
-
-        let cluster_name = ClusterName(expanded_name.clone());
-        let placeholder_group = ClusterGroupName("_".to_string());
-        let adapter = match registered_engines::build_adapter_from_record(
-            cluster_name,
-            placeholder_group,
-            &parent.engine_key,
-            merged_config,
-        )
-        .await
-        {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::error!(
-                    cluster = %expanded_name,
-                    error = %e,
-                    "Reload: failed to build engine adapter for variant — omitted"
-                );
-                continue;
-            }
-        };
-        cache.adapters.insert(expanded_name.clone(), adapter);
-        cache.config_json.insert(expanded_name.clone(), cfg_json);
-    }
-
-    cache
-        .adapters
-        .retain(|name, _| all_cluster_names.contains(name));
-    cache
-        .config_json
-        .retain(|name, _| all_cluster_names.contains(name));
-
-    // Build group states.
-    let mut group_states: GroupStatesMap = HashMap::new();
-    let mut group_members: HashMap<String, Vec<String>> = HashMap::new();
-    let mut group_order: Vec<String> = Vec::new();
-
-    for (group_name, group_config) in cluster_groups {
-        if !group_config.enabled {
-            continue;
-        }
-        if let Some(breaker) = &group_config.circuit_breaker {
-            breaker
-                .validate()
-                .map_err(|e| anyhow::anyhow!("group '{group_name}': {e}"))?;
-        }
-        let group_key = ClusterGroupName(group_name.clone());
-        let mut states: Vec<Arc<ClusterState>> = Vec::new();
-        let mut seen_members: HashSet<&str> = HashSet::new();
-
-        for member_name in &group_config.members {
-            if !seen_members.insert(member_name.as_str()) {
-                tracing::warn!(
-                    group = %group_name,
-                    cluster = %member_name,
-                    "Reload: duplicate cluster in group members — ignoring extra entry"
-                );
-                continue;
-            }
-            // Resolve member: check base records first, then expanded variant names.
-            let record = match records_by_name.get(member_name.as_str()) {
-                Some(r) => *r,
-                None => match expanded_to_parent.get(member_name.as_str()) {
-                    Some(r) => *r,
-                    None => {
-                        tracing::warn!(group = %group_name, cluster = %member_name, "Reload: group references unknown cluster");
-                        continue;
-                    }
-                },
-            };
-            if !cache.adapters.contains_key(member_name.as_str()) {
-                tracing::info!(group = %group_name, cluster = %member_name, "Reload: skipping disabled/missing cluster in group");
-                continue;
-            }
-            let engine = match parse_engine_key(&record.engine_key) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let engine_type = EngineType::from(&engine);
-            // For expanded variants, use the variant-specific max_running_queries if set.
-            // `?` (not `.unwrap_or_else` — a closure can't propagate `?` out of this
-            // function) so an invalid `max_running_queries` on the base record rejects
-            // the reload here exactly like the non-variant fallback, instead of
-            // silently falling back to the group default.
-            let variant_max_override = expanded_configs
-                .get(member_name.as_str())
-                .and_then(|(_, variant_max, _, _)| *variant_max);
-            let max_q = match variant_max_override {
-                Some(v) => v,
-                None => max_running_queries_u64_from_db(member_name, record.max_running_queries)?
-                    .unwrap_or(group_config.max_running_queries),
-            };
-            // For expanded variants, use merged config for endpoint resolution.
-            let effective_config = expanded_configs
-                .get(member_name.as_str())
-                .map(|(cfg, _, _, _)| cfg)
-                .unwrap_or(&record.config);
-            let endpoint = json_str(effective_config, "endpoint");
-            let cluster_cid = cluster_ids_by_name
-                .get(member_name.as_str())
-                .copied()
-                .or_else(|| expanded_to_parent.get(member_name.as_str()).map(|r| r.id));
-            let group_cid = group_ids_by_name.get(group_name.as_str()).copied();
-
-            // When the JSONB + engine_key fingerprint is unchanged, rebuild `ClusterState` from
-            // the current record anyway (group membership, IDs, endpoint, max_q may still change)
-            // but copy health and queue counters from the previous generation.
-            let cfg_json = serde_json::to_string(&(record.engine_key.as_str(), effective_config))
-                .unwrap_or_default();
-            let config_unchanged = prev_config_json
-                .get(member_name.as_str())
-                .map(String::as_str)
-                == Some(cfg_json.as_str());
-
-            let previous = cache
-                .cluster_states
-                .get(&(group_name.clone(), member_name.clone()));
-            let previous_unchanged = if config_unchanged {
-                previous.map(Arc::as_ref)
-            } else {
-                None
-            };
-            // Load counters are shared (not copied) with the previous generation, whether or not
-            // the config changed. Queries admitted before this reload are still running on this
-            // member and release through either generation: sync dispatch through the manager
-            // that admitted them (a copied count would leak, #299), async terminals through the
-            // current one (a fresh counter would miss them and over-admit, #301).
-            let state = Arc::new(
-                ClusterState::new(
-                    ClusterName(member_name.clone()),
-                    group_key.clone(),
-                    cluster_cid,
-                    group_cid,
-                    engine_type,
-                    endpoint,
-                    max_q,
-                    record.enabled,
-                )
-                .with_circuit_breaker(group_config.circuit_breaker.clone(), previous_unchanged)
-                .with_shared_load_counters(previous.map(Arc::as_ref)),
-            );
-            if let Some(prev) = previous {
-                state.set_healthy(prev.is_healthy());
-            }
-            states.push(state);
-        }
-
-        let strategy = match strategy_from_config(group_config.strategy.as_ref()) {
-            Ok(s) => {
-                cache.strategies.insert(group_name.clone(), s.clone());
-                s
-            }
-            Err(e) => {
-                if let Some(prev) = cache.strategies.get(group_name.as_str()) {
-                    tracing::warn!(
-                        group = %group_name,
-                        error = %e,
-                        "Reload: failed to build cluster-selection strategy; keeping this group's previous strategy"
-                    );
-                    prev.clone()
-                } else {
-                    tracing::warn!(
-                        group = %group_name,
-                        error = %e,
-                        "Reload: failed to build cluster-selection strategy; no previous strategy cached, falling back to round robin"
-                    );
-                    Arc::new(RoundRobinStrategy::new())
-                }
-            }
-        };
-        group_members.insert(group_name.clone(), group_config.members.clone());
-        group_order.push(group_name.clone());
-        group_states.insert(group_key, (states, strategy));
-    }
-    group_order.sort();
-    // Drop cached strategies for groups that no longer exist, so a deleted-then-recreated
-    // group name can't inherit the old group's strategy if the new one's build ever fails.
-    cache
-        .strategies
-        .retain(|name, _| cluster_groups.contains_key(name.as_str()));
-
-    let health_check_targets = health_targets_from_groups(&group_states, &cache.adapters);
-    let rebuilt_cluster_states = health_check_targets
-        .iter()
-        .map(|(_, s)| {
-            (
-                (s.group_name.0.clone(), s.cluster_name.0.clone()),
-                s.clone(),
-            )
-        })
-        .collect();
-    let cluster_manager = Arc::new(SimpleClusterGroupManager::new(group_states));
-
-    // Build minimal ClusterConfig values for BackendIdentityResolver (`queryAuth` from JSONB).
-    let mut cluster_configs: HashMap<String, queryflux_core::config::ClusterConfig> =
-        HashMap::new();
-    for r in cluster_records {
-        let engine = match parse_engine_key(&r.engine_key) {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!(cluster = %r.name, "reload: {err}");
-                continue;
-            }
-        };
-        let query_auth = parse_query_auth_from_config_json(&r.config).map_err(|e| {
-            anyhow::anyhow!("cluster '{}': invalid queryAuth in JSONB: {e}", r.name)
-        })?;
-        let auth = match parse_auth_from_config_json(&r.config) {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::warn!(
-                    cluster = %r.name,
-                    "reload: invalid auth in cluster config JSON: {e}"
-                );
-                None
-            }
-        };
-        let max_running = max_running_queries_u64_from_db(&r.name, r.max_running_queries)?;
-        let base_cfg = cluster_config_from_persisted_json(
-            engine.clone(),
-            r.enabled,
-            max_running,
-            &r.config,
-            auth.clone(),
-            query_auth.clone(),
-        );
-
-        let variants = parse_cluster_variants(&r.variants);
-        if variants.is_empty() {
-            let mut base_cfg = base_cfg;
-            apply_default_probe_queries(&mut base_cfg, &r.engine_key, &r.config);
-            cluster_configs.insert(r.name.clone(), base_cfg);
-        } else {
-            // Insert a ClusterConfig entry for each expanded variant name.
-            for (expanded_name, (_, variant_max, hcq, rq)) in &expanded_configs {
-                if expanded_name.starts_with(&format!("{}::", r.name)) {
-                    let mut variant_cfg = base_cfg.clone();
-                    variant_cfg.max_running_queries = variant_max.or(max_running);
-                    variant_cfg.health_check_query = hcq.clone();
-                    variant_cfg.reconcile_query = rq.clone();
-                    cluster_configs.insert(expanded_name.clone(), variant_cfg);
-                }
-            }
-        }
-    }
-
-    // Build router chain.
-    let fallback = ClusterGroupName(routing_fallback.to_string());
-    let mut routers: Vec<Box<dyn RouterTrait>> = Vec::new();
-    for router_cfg in routers_cfg {
-        use queryflux_core::config::RouterConfig;
-        match router_cfg {
-            RouterConfig::ProtocolBased {
-                trino_http,
-                postgres_wire,
-                mysql_wire,
-                clickhouse_http,
-                flight_sql,
-                snowflake_http,
-                snowflake_sql_api,
-                mcp,
-            } => {
-                routers.push(Box::new(
-                    queryflux_routing::implementations::protocol_based::ProtocolBasedRouter {
-                        trino_http: trino_http.as_ref().map(|s| ClusterGroupName(s.clone())),
-                        postgres_wire: postgres_wire.as_ref().map(|s| ClusterGroupName(s.clone())),
-                        mysql_wire: mysql_wire.as_ref().map(|s| ClusterGroupName(s.clone())),
-                        clickhouse_http: clickhouse_http
-                            .as_ref()
-                            .map(|s| ClusterGroupName(s.clone())),
-                        flight_sql: flight_sql.as_ref().map(|s| ClusterGroupName(s.clone())),
-                        snowflake_http: snowflake_http
-                            .as_ref()
-                            .map(|s| ClusterGroupName(s.clone())),
-                        snowflake_sql_api: snowflake_sql_api
-                            .as_ref()
-                            .map(|s| ClusterGroupName(s.clone())),
-                        mcp: mcp.as_ref().map(|s| ClusterGroupName(s.clone())),
-                    },
-                ));
-            }
-            RouterConfig::Header {
-                header_name,
-                header_value_to_group,
-            } => {
-                let mapping = header_value_to_group
-                    .iter()
-                    .map(|(k, v)| (k.clone(), ClusterGroupName(v.clone())))
-                    .collect();
-                routers.push(Box::new(
-                    queryflux_routing::implementations::header::HeaderRouter::new(
-                        header_name.clone(),
-                        mapping,
-                    ),
-                ));
-            }
-            RouterConfig::UserGroup { user_to_group } => {
-                let mapping = user_to_group
-                    .iter()
-                    .map(|(k, v)| (k.clone(), ClusterGroupName(v.clone())))
-                    .collect();
-                routers.push(Box::new(
-                    queryflux_routing::implementations::user_group::UserGroupRouter::new(mapping),
-                ));
-            }
-            RouterConfig::QueryRegex { rules } => {
-                routers.push(Box::new(
-                    queryflux_routing::implementations::query_regex::QueryRegexRouter::from_rules(
-                        rules.clone(),
-                    ),
-                ));
-            }
-            RouterConfig::Tags { rules } => {
-                routers.push(Box::new(
-                    queryflux_routing::implementations::tags::TagsRouter::new(rules.clone()),
-                ));
-            }
-            RouterConfig::PythonScript {
-                script,
-                script_file,
-            } => {
-                let router = if let Some(path) = script_file {
-                    match queryflux_routing::implementations::python_script::PythonScriptRouter::from_file(path) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::warn!("Reload: failed to load routing script from {path}: {e}");
-                            continue;
-                        }
-                    }
-                } else {
-                    queryflux_routing::implementations::python_script::PythonScriptRouter::new(
-                        script.clone(),
-                    )
-                };
-                routers.push(Box::new(router));
-            }
-            RouterConfig::Compound {
-                combine,
-                conditions,
-                target_group,
-            } => {
-                routers.push(Box::new(
-                    queryflux_routing::implementations::compound::CompoundRouter::new(
-                        *combine,
-                        conditions.clone(),
-                        target_group.clone(),
-                    ),
-                ));
-            }
-        }
-    }
-    let router_chain = RouterChain::new(routers, fallback);
-
-    let group_default_tags: HashMap<String, QueryTags> = cluster_groups
-        .iter()
-        .filter(|(_, g)| !g.default_tags.is_empty())
-        .map(|(name, g)| (name.clone(), g.default_tags.clone()))
-        .collect();
-
-    let group_max_queued_queries: HashMap<String, Option<u64>> = cluster_groups
-        .iter()
-        .filter(|(_, g)| g.max_queued_queries.is_some())
-        .map(|(name, g)| (name.clone(), g.max_queued_queries))
-        .collect();
-
-    let group_capacity_wait_timeout_secs: HashMap<String, u64> = cluster_groups
-        .iter()
-        .map(|(name, g)| (name.clone(), g.capacity_wait_timeout_secs_or_default()))
-        .collect();
-
-    let group_cache_settings: HashMap<String, queryflux_core::config::GroupCacheConfig> =
-        cluster_groups
-            .iter()
-            .filter_map(|(name, g)| {
-                g.cache
-                    .as_ref()
-                    .filter(|c| c.enabled)
-                    .map(|c| (name.clone(), c.clone()))
-            })
-            .collect();
-
-    // Referential integrity: routers must target groups that exist in this reload cycle,
-    // and every declared group member must have a built adapter. A stale read (e.g. a
-    // group deleted between the cluster read and the group read) would produce a live
-    // config where dispatch returns NoClusterGroupAvailable with no explanation.
-    // On any inconsistency, bail out so the caller keeps the previous LiveConfig.
-    let issues = validate_live_config_refs(
-        routers_cfg,
-        routing_fallback,
-        &group_members,
-        &cache.adapters,
-    );
-    if !issues.is_empty() {
-        for issue in &issues {
-            tracing::warn!("Live config validation: {issue}");
-        }
-        return Err(anyhow::anyhow!(
-            "Live config is internally inconsistent ({} issue(s)); keeping previous config",
-            issues.len()
-        ));
-    }
-
-    // Build custom health/reconcile query maps from cluster configs.
-    let mut custom_health_queries: HashMap<String, String> = HashMap::new();
-    let mut custom_reconcile_queries: HashMap<String, String> = HashMap::new();
-    for (name, cfg) in &cluster_configs {
-        if let Some(q) = &cfg.health_check_query {
-            custom_health_queries.insert(name.clone(), q.clone());
-        }
-        if let Some(q) = &cfg.reconcile_query {
-            custom_reconcile_queries.insert(name.clone(), q.clone());
-        }
-    }
-
-    cache.cluster_states = rebuilt_cluster_states;
-    Ok(LiveConfig {
-        router_chain,
-        guard_chain: None,
-        group_guard_chains: HashMap::new(),
-        // Placeholder — `reload_live_config` immediately carries forward the previous
-        // value, same as `guard_chain`/`group_guard_chains` above.
-        access_control_guard: None,
-        cluster_manager,
-        adapters: cache.adapters.clone(),
-        health_check_targets,
-        custom_health_queries,
-        custom_reconcile_queries,
-        cluster_configs,
-        group_members,
-        group_order,
-        group_translation_scripts,
-        group_default_tags,
-        group_max_queued_queries,
-        group_capacity_wait_timeout_secs,
-        group_cache_settings,
-        auth_provider: Arc::new(NoneAuthProvider::new(false)),
-        authorization: Arc::new(AllowAllAuthorization::default()),
-        // Placeholder — `reload_live_config` immediately overwrites this with the
-        // carried-forward previous value (and possibly a fresh one from
-        // `catalog_config`), same as `auth_provider`/`authorization` above.
-        catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
-    })
-}
-
-/// Load cluster/group configs + routing config from Postgres and build a fresh `LiveConfig`.
-/// Existing adapter instances are reused for clusters that haven't changed.
-///
-/// Cluster records are passed directly to `build_live_config` — no `to_core()` conversion.
-/// Hot pieces carried over from the previous `LiveConfig` when their backing
-/// rows are absent from the backend (never configured via admin) or fail to
-/// parse. A reload must never revert auth to permissive defaults or drop
-/// YAML-configured guard chains just because no row was ever written.
-struct PreservedLive {
-    auth_provider: Arc<dyn queryflux_auth::AuthProvider>,
-    authorization: Arc<dyn queryflux_auth::AuthorizationChecker>,
-    guard_chain: Option<Arc<GuardChain>>,
-    group_guard_chains: HashMap<String, Arc<GuardChain>>,
-    access_control_guard: Option<Arc<OpaAccessGuard>>,
-    catalog: Arc<dyn queryflux_core::catalog::CatalogProvider>,
-}
-
-async fn reload_live_config(
-    pg: &Arc<dyn BackendStore>,
-    cache: &mut AdapterReloadCache,
-    prev: &PreservedLive,
-    metrics: &Arc<dyn MetricsStore>,
-) -> Result<LiveConfig> {
-    let cluster_records = pg
-        .list_cluster_configs()
-        .await
-        .context("reload: list_cluster_configs")?;
-    let mut cluster_ids_by_name: HashMap<String, i64> = cluster_records
-        .iter()
-        .map(|r| (r.name.clone(), r.id))
-        .collect();
-    // Also map expanded variant names to their parent's DB ID.
-    for r in &cluster_records {
-        for v in &parse_cluster_variants(&r.variants) {
-            cluster_ids_by_name.insert(format!("{}::{}", r.name, v.name), r.id);
-        }
-    }
-
-    let group_records = pg
-        .list_group_configs()
-        .await
-        .context("reload: list_group_configs")?;
-    let group_ids_by_name: HashMap<String, i64> = group_records
-        .iter()
-        .map(|r| (r.name.clone(), r.id))
-        .collect();
-    let cluster_groups: std::collections::HashMap<
-        String,
-        queryflux_core::config::ClusterGroupConfig,
-    > = group_records
-        .into_iter()
-        .map(|r| Ok((r.name.clone(), r.to_core().map_err(anyhow::Error::msg)?)))
-        .collect::<Result<_>>()?;
-
-    // Load routing from DB if present; otherwise keep last-known routing (startup YAML or previous DB load).
-    let (routing_fallback, routers_cfg) = match pg.load_routing_config().await {
-        Ok(Some(loaded)) => {
-            let mut routers = Vec::new();
-            for v in loaded.routers {
-                match serde_json::from_value::<queryflux_core::config::RouterConfig>(v) {
-                    Ok(r) => routers.push(r),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Reload: skipping invalid routing_rules row")
-                    }
-                }
-            }
-            cache.routing_fallback = loaded.routing_fallback.clone();
-            cache.routers_cfg.clone_from(&routers);
-            (loaded.routing_fallback, routers)
-        }
-        Ok(None) => (cache.routing_fallback.clone(), cache.routers_cfg.clone()),
-        Err(e) => {
-            return Err(anyhow::anyhow!("reload: load_routing_config: {e}"));
-        }
-    };
-
-    let group_translation_scripts = pg
-        .load_group_translation_bodies()
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "reload: load_group_translation_bodies failed");
-            HashMap::new()
-        });
-    let group_translation_scripts = validate_group_translation_scripts(group_translation_scripts);
-    let guard_script_bodies = load_guard_script_bodies(Some(pg.as_ref() as &dyn AdminStore)).await;
-
-    let mut live = build_live_config(
-        &cluster_records,
-        &cluster_groups,
-        &cluster_ids_by_name,
-        &group_ids_by_name,
-        &routers_cfg,
-        &routing_fallback,
-        group_translation_scripts,
-        cache,
-    )
-    .await?;
-
-    // Carry forward the pieces build_live_config seeds with placeholders. The
-    // DB reads below only *override* these on success — a missing row or a
-    // parse failure keeps the previous (startup-YAML or last-good) values.
-    live.auth_provider = prev.auth_provider.clone();
-    live.authorization = prev.authorization.clone();
-    live.guard_chain = prev.guard_chain.clone();
-    live.group_guard_chains = prev.group_guard_chains.clone();
-    // Startup already applied any stored `access_control_config` over the YAML; reload
-    // re-reads it below and overrides on success (same contract as catalog / guardrails).
-    live.access_control_guard = prev.access_control_guard.clone();
-    live.catalog = prev.catalog.clone();
-
-    // Guardrails from DB (UI-managed) override carried-over chains. An admin
-    // "clear" still writes an empty `global` row, so Ok(None) can only mean
-    // "never configured via admin" — keep the previous (e.g. YAML) chains.
-    match pg.get_proxy_setting("guardrails_config").await {
-        Ok(Some(v)) => {
-            let (global, groups) = build_guard_chains_from_db_value(&v, &guard_script_bodies);
-            live.guard_chain = global;
-            live.group_guard_chains = groups;
-        }
-        Ok(None) => {}
-        Err(e) => {
-            metrics.on_config_reload_failure("guard_reload");
-            tracing::warn!("Reload: guardrails_config read failed; keeping previous chains: {e}")
-        }
-    }
-
-    // Rebuild auth/authz from persisted security config. On a missing row or
-    // any parse/build failure keep the carried-over providers — a reload must
-    // never fall back to permissive defaults.
-    match pg.get_proxy_setting("security_config").await {
-        Ok(Some(v)) if queryflux_core::security_setting::is_blank_security_setting(&v) => {}
-        Ok(Some(v)) => {
-            let (auth_cfg, authz_cfg) =
-                queryflux_core::security_setting::parse_security_setting(&v);
-            match auth_cfg.as_ref().map(|cfg| build_auth_provider(cfg)) {
-                Some(Ok(provider)) => live.auth_provider = provider,
-                Some(Err(e)) => {
-                    metrics.on_config_reload_failure("auth_rebuild");
-                    tracing::warn!("Reload: failed to rebuild auth provider; keeping previous: {e}")
-                }
-                None => {
-                    metrics.on_config_reload_failure("auth_rebuild");
-                    tracing::warn!(
-                        "Reload: security_config has no recognizable auth section; keeping previous"
-                    );
-                }
-            }
-            match auth_cfg {
-                Some(auth) => {
-                    let operators = operators_from_auth(&auth);
-                    match authz_cfg.map(|cfg| build_authorization(&cfg, &cluster_groups, operators))
-                    {
-                        Some(Ok(checker)) => live.authorization = checker,
-                        Some(Err(e)) => {
-                            metrics.on_config_reload_failure("authz_rebuild");
-                            tracing::warn!(
-                                "Reload: failed to rebuild authorization; keeping previous: {e}"
-                            )
-                        }
-                        None => {
-                            metrics.on_config_reload_failure("authz_rebuild");
-                            tracing::warn!(
-                            "Reload: security_config has no recognizable authorization section; keeping previous"
-                        );
-                        }
-                    }
-                }
-                None if authz_cfg.is_some() => {
-                    metrics.on_config_reload_failure("authz_rebuild");
-                    tracing::warn!(
-                        "Reload: security_config has authorization but no auth section; keeping previous authorization (operator policy unchanged)"
-                    );
-                }
-                None => {}
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            metrics.on_config_reload_failure("auth_rebuild");
-            tracing::warn!("Reload: security_config read failed; keeping previous auth: {e}")
-        }
-    }
-
-    // Rebuild the catalog provider from persisted config. A missing row means
-    // "never configured via admin" (keep the carried-over, e.g. startup-YAML,
-    // provider); a parse failure keeps the previous provider too — a reload must
-    // never silently fall back to `NullCatalogProvider` and quietly stop
-    // discovering schema for already-working translation.
-    match pg.get_proxy_setting("catalog_config").await {
-        Ok(Some(v)) => {
-            match serde_json::from_value::<queryflux_core::config::CatalogProviderConfig>(v) {
-                Ok(cfg) => live.catalog = queryflux_catalog::build_catalog_provider(&cfg).await,
-                Err(e) => {
-                    metrics.on_config_reload_failure("catalog_reload");
-                    tracing::warn!(
-                        "Reload: catalog_config parse failed; keeping previous catalog: {e}"
-                    )
-                }
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            metrics.on_config_reload_failure("catalog_reload");
-            tracing::warn!("Reload: catalog_config read failed; keeping previous catalog: {e}")
-        }
-    }
-
-    match pg.get_proxy_setting("access_control_config").await {
-        Ok(Some(v)) => match apply_stored_access_control(&v) {
-            Ok(guard) => live.access_control_guard = guard,
-            Err(e) => {
-                metrics.on_config_reload_failure("access_control_reload");
-                tracing::warn!(
-                    "Reload: access_control_config parse/build failed; keeping previous: {e}"
-                )
-            }
-        },
-        Ok(None) => {}
-        Err(e) => {
-            metrics.on_config_reload_failure("access_control_reload");
-            tracing::warn!(
-                "Reload: access_control_config read failed; keeping previous access control: {e}"
-            )
-        }
-    }
-
-    Ok(live)
-}
-
-fn build_auth_provider(
-    auth: &queryflux_core::config::AuthConfig,
-) -> Result<Arc<dyn queryflux_auth::AuthProvider>> {
-    use queryflux_core::config::AuthProviderConfig;
-    let auth_required = auth.required;
-    Ok(match &auth.provider {
-        AuthProviderConfig::None => {
-            info!("Auth provider: none (network-trust only)");
-            Arc::new(NoneAuthProvider::new(auth_required))
-        }
-        AuthProviderConfig::Static => {
-            let users = auth
-                .static_users
-                .as_ref()
-                .context("auth.provider = static requires auth.staticUsers to be configured")?
-                .users
-                .clone();
-            info!(user_count = users.len(), "Auth provider: static");
-            Arc::new(StaticAuthProvider::new(users, auth_required))
-        }
-        AuthProviderConfig::Oidc => {
-            let oidc_cfg = auth
-                .oidc
-                .clone()
-                .context("auth.provider = oidc requires auth.oidc to be configured")?;
-            info!(issuer = %oidc_cfg.issuer, "Auth provider: OIDC");
-            Arc::new(OidcAuthProvider::new(oidc_cfg, auth_required))
-        }
-        AuthProviderConfig::Ldap => {
-            let ldap_cfg = auth
-                .ldap
-                .clone()
-                .context("auth.provider = ldap requires auth.ldap to be configured")?;
-            info!(url = %ldap_cfg.url, "Auth provider: LDAP");
-            Arc::new(LdapAuthProvider::new(ldap_cfg, auth_required))
-        }
-    })
-}
-
-fn operators_from_auth(
-    auth: &queryflux_core::config::AuthConfig,
-) -> queryflux_auth::OperatorPolicy {
-    queryflux_auth::OperatorPolicy::from_lists(
-        auth.operator_roles.clone(),
-        auth.operator_groups.clone(),
-    )
-}
-
-fn build_authorization(
-    authz: &queryflux_core::config::AuthorizationConfig,
-    cluster_groups: &HashMap<String, queryflux_core::config::ClusterGroupConfig>,
-    operators: queryflux_auth::OperatorPolicy,
-) -> Result<Arc<dyn queryflux_auth::AuthorizationChecker>> {
-    use queryflux_core::config::AuthorizationProviderConfig;
-    if !operators.roles.is_empty() || !operators.groups.is_empty() {
-        info!(
-            operator_roles = ?operators.roles,
-            operator_groups = ?operators.groups,
-            "Query operators configured (may cancel any query)"
-        );
-    }
-    Ok(match &authz.provider {
-        AuthorizationProviderConfig::None => {
-            let policies = cluster_groups
-                .iter()
-                .map(|(name, cfg)| (name.clone(), cfg.authorization.clone()))
-                .collect();
-            let has_any_policy = cluster_groups.values().any(|cfg| {
-                !cfg.authorization.allow_groups.is_empty()
-                    || !cfg.authorization.allow_users.is_empty()
-            });
-            if has_any_policy {
-                info!("Authorization: simple allow-list policy");
-                Arc::new(SimpleAuthorizationPolicy::new(policies).with_operators(operators))
-            } else {
-                info!("Authorization: allow-all (no allow-lists configured)");
-                Arc::new(AllowAllAuthorization::with_operators(operators))
-            }
-        }
-        AuthorizationProviderConfig::OpenFga => {
-            let openfga_cfg = authz.openfga.clone().context(
-                "authorization.provider = openfga requires authorization.openfga to be configured",
-            )?;
-            info!(url = %openfga_cfg.url, store_id = %openfga_cfg.store_id, "Authorization: OpenFGA");
-            Arc::new(OpenFgaAuthorizationClient::new(openfga_cfg).with_operators(operators))
-        }
-    })
-}
-
-/// Drops any persisted translation fixup script that fails
-/// [`queryflux_translation::sqlglot::validate_fixup_script`] — most commonly one written
-/// against the pre-this-PR `transform(ast, src, dst) -> None` contract rather than the
-/// current `transform(sql: str, src: str, dst: str) -> str`. Scripts are user/admin-editable
-/// (Studio), so a stale one must not block the whole proxy from starting or reloading;
-/// dropping just that script (with a loud warning naming the group and index) means the
-/// group's other fixups and translation still work, instead of every query for that group
-/// failing at translation time on first use.
-fn validate_group_translation_scripts(
-    scripts: HashMap<String, Vec<String>>,
-) -> HashMap<String, Vec<String>> {
-    scripts
-        .into_iter()
-        .map(|(group, group_scripts)| {
-            let valid = group_scripts
-                .into_iter()
-                .enumerate()
-                .filter_map(|(i, script)| {
-                    match queryflux_translation::sqlglot::validate_fixup_script(&script) {
-                        Ok(()) => Some(script),
-                        Err(e) => {
-                            tracing::error!(
-                                group = %group, index = i,
-                                "translation fixup script failed validation and will not run: {e}"
-                            );
-                            None
-                        }
-                    }
-                })
-                .collect();
-            (group, valid)
-        })
-        .collect()
-}
-
-async fn load_guard_script_bodies(store: Option<&dyn AdminStore>) -> HashMap<i64, String> {
-    let Some(store) = store else {
-        return HashMap::new();
-    };
-    load_guard_script_bodies_from_admin(store).await
-}
-
-async fn load_guard_script_bodies_from_admin(admin: &dyn AdminStore) -> HashMap<i64, String> {
-    admin
-        .list_user_scripts(Some(KIND_GUARD))
-        .await
-        .map(|scripts| scripts.into_iter().map(|s| (s.id, s.body)).collect())
-        .unwrap_or_else(|e| {
-            tracing::warn!("Failed to load guard scripts from persistence: {e}");
-            HashMap::new()
-        })
-}
-
-fn resolve_built_in_guard(
-    name: Option<&str>,
-    max_rows: Option<u64>,
-    applies_to: Option<Vec<String>>,
-) -> Box<dyn Guard> {
-    match name {
-        Some("read_only") => Box::new(ReadOnlyGuard),
-        Some("row_limit") => Box::new(RowLimitGuard { max_rows }),
-        Some("require_predicate") => Box::new(RequirePredicateGuard {
-            applies_to: applies_to.unwrap_or_default(),
-        }),
-        Some(other) => Box::new(MisconfiguredGuard {
-            guard_name: "built_in",
-            reason: format!("unsupported built_in guard name \"{other}\""),
-        }),
-        None => Box::new(MisconfiguredGuard {
-            guard_name: "built_in",
-            reason: "built_in guard is missing required field \"name\"".to_string(),
-        }),
-    }
-}
-
-fn resolve_python_guard_script(
-    inline_script: Option<String>,
-    script_id: Option<i64>,
-    timeout_ms: Option<u64>,
-    guard_script_bodies: &HashMap<i64, String>,
-) -> Box<dyn Guard> {
-    if let Some(script) = inline_script.filter(|s| !s.trim().is_empty()) {
-        return Box::new(PythonScriptGuard { script, timeout_ms });
-    }
-    if let Some(script_id) = script_id {
-        if let Some(script) = guard_script_bodies.get(&script_id) {
-            return Box::new(PythonScriptGuard {
-                script: script.clone(),
-                timeout_ms,
-            });
-        }
-        return Box::new(MisconfiguredGuard {
-            guard_name: "python_script",
-            reason: format!("python_script guard references missing guard script id {script_id}"),
-        });
-    }
-    Box::new(MisconfiguredGuard {
-        guard_name: "python_script",
-        reason: "python_script guard requires either script or script_id".to_string(),
-    })
-}
-
-fn make_http_webhook_guard(
-    url: String,
-    timeout_ms: Option<u64>,
-    retry_count: u32,
-    fail_behavior: FailBehavior,
-    headers: HashMap<String, String>,
-) -> Box<dyn Guard> {
-    let raw = url.trim();
-    if raw.is_empty() {
-        tracing::warn!("http_webhook guard has empty URL; using MisconfiguredGuard");
-        return Box::new(MisconfiguredGuard {
-            guard_name: "http_webhook",
-            reason: "http_webhook guard is missing required field \"url\"".to_string(),
-        });
-    }
-    match reqwest::Url::parse(raw) {
-        Ok(parsed) => match parsed.scheme() {
-            "http" | "https" => Box::new(HttpWebhookGuard {
-                url: raw.to_string(),
-                timeout_ms,
-                retry_count,
-                fail_behavior,
-                headers,
-                client: reqwest::Client::new(),
-            }),
-            other => {
-                tracing::warn!(
-                    scheme = other,
-                    "http_webhook guard URL must use http or https; using MisconfiguredGuard"
-                );
-                Box::new(MisconfiguredGuard {
-                    guard_name: "http_webhook",
-                    reason: format!(
-                        "http_webhook url must use http or https scheme, got \"{other}\""
-                    ),
-                })
-            }
-        },
-        Err(e) => {
-            tracing::warn!(error = %e, "http_webhook guard URL is invalid; using MisconfiguredGuard");
-            Box::new(MisconfiguredGuard {
-                guard_name: "http_webhook",
-                reason: format!("http_webhook url is not a valid URL: {e}"),
-            })
-        }
-    }
-}
-
-/// Build the data access-control guard at startup.
-///
-/// A persisted `access_control_config` (Studio / admin API) is authoritative when present —
-/// the same contract reload and guardrails follow — so a restart doesn't leave the stored
-/// policy inactive behind a missing or weaker YAML section. Without one, the `access_control:`
-/// YAML section is used, and `None` when that is absent too.
-///
-/// Anything that stops a stored policy from being read or built aborts startup: serving
-/// queries with a weaker policy than the operator saved would be a silent bypass. The YAML
-/// was already validated by `ProxyConfig::validate_startup_security`, so a residual build
-/// failure there aborts too rather than quietly disabling enforcement.
-async fn build_access_control_guard(
-    config: &queryflux_core::config::ProxyConfig,
-    backend: Option<&dyn BackendStore>,
-) -> Result<Option<Arc<OpaAccessGuard>>> {
-    if let Some(store) = backend {
-        match store.get_proxy_setting("access_control_config").await {
-            Ok(Some(v)) => {
-                return apply_stored_access_control(&v).map_err(|e| {
-                    anyhow::anyhow!(
-                        "stored access_control_config could not be applied; refusing to start \
-                         with a weaker policy: {e}"
-                    )
-                });
-            }
-            Ok(None) => {}
-            Err(e) => anyhow::bail!(
-                "could not read stored access_control_config; refusing to start with a \
-                 possibly weaker policy: {e}"
-            ),
-        }
-    }
-    let Some(cfg) = config.access_control.as_ref() else {
-        return Ok(None);
-    };
-    OpaAccessGuard::try_from_config(cfg)
-        .map(Some)
-        .map_err(|e| anyhow::anyhow!("access_control config failed to build: {e}"))
-}
-
-fn apply_stored_access_control(
-    v: &serde_json::Value,
-) -> std::result::Result<Option<Arc<OpaAccessGuard>>, String> {
-    match queryflux_core::access_config::AccessControlConfig::from_admin_value(v)? {
-        None => Ok(None),
-        Some(cfg) => Ok(Some(OpaAccessGuard::try_from_config(&cfg)?)),
-    }
-}
-
-/// Build YAML guard specs into a `GuardChain`. Returns `None` when the list is empty
-/// or contains only unrecognised entries.
-fn build_chain_from_yaml_specs(
-    specs: &[queryflux_core::config::GuardSpecConfig],
-    guard_script_bodies: &HashMap<i64, String>,
-) -> Option<Arc<GuardChain>> {
-    use queryflux_core::config::{GuardFailBehaviorConfig, GuardKindConfig};
-    let mut guards: Vec<Box<dyn Guard>> = Vec::new();
-    for spec in specs {
-        match &spec.kind {
-            GuardKindConfig::BuiltIn => {
-                guards.push(resolve_built_in_guard(
-                    spec.name.as_deref(),
-                    spec.max_rows,
-                    spec.applies_to.clone(),
-                ));
-            }
-            GuardKindConfig::PythonScript => {
-                let guard = resolve_python_guard_script(
-                    spec.script.clone(),
-                    spec.script_id,
-                    spec.timeout_ms,
-                    guard_script_bodies,
-                );
-                guards.push(guard);
-            }
-            GuardKindConfig::HttpWebhook => {
-                guards.push(make_http_webhook_guard(
-                    spec.url.clone().unwrap_or_default(),
-                    spec.timeout_ms,
-                    spec.retry_count.unwrap_or(0),
-                    match spec.fail_behavior {
-                        Some(GuardFailBehaviorConfig::Allow) => FailBehavior::Allow,
-                        _ => FailBehavior::Deny,
-                    },
-                    spec.headers.clone().unwrap_or_default(),
-                ));
-            }
-        }
-    }
-    if guards.is_empty() {
-        None
-    } else {
-        Some(Arc::new(GuardChain::new(guards)))
-    }
-}
-
-/// Build global + per-group guard chains from the YAML `guardrails:` section.
-fn build_guard_chains(
-    config: &queryflux_core::config::ProxyConfig,
-    guard_script_bodies: &HashMap<i64, String>,
-) -> (Option<Arc<GuardChain>>, HashMap<String, Arc<GuardChain>>) {
-    let Some(cfg) = config.guardrails.as_ref() else {
-        return (None, HashMap::new());
-    };
-    let global = build_chain_from_yaml_specs(&cfg.global, guard_script_bodies);
-    let groups = cfg
-        .groups
-        .iter()
-        .filter_map(|(name, specs)| {
-            build_chain_from_yaml_specs(specs, guard_script_bodies)
-                .map(|chain| (name.clone(), chain))
-        })
-        .collect();
-    (global, groups)
-}
-
-/// Build DB guard specs (kind string format) into a `GuardChain`.
-fn build_chain_from_db_specs(
-    specs: &serde_json::Value,
-    guard_script_bodies: &HashMap<i64, String>,
-) -> Option<Arc<GuardChain>> {
-    struct DbGuardSpec {
-        kind: String,
-        name: Option<String>,
-        max_rows: Option<u64>,
-        applies_to: Option<Vec<String>>,
-        script_id: Option<i64>,
-        script: Option<String>,
-        url: Option<String>,
-        timeout_ms: Option<u64>,
-        retry_count: Option<u32>,
-        fail_behavior: Option<String>,
-        headers: Option<HashMap<String, String>>,
-    }
-    fn parse_spec(item: &serde_json::Value) -> Option<DbGuardSpec> {
-        let o = item.as_object()?;
-        Some(DbGuardSpec {
-            kind: o.get("kind")?.as_str()?.to_string(),
-            name: o
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            max_rows: o.get("max_rows").and_then(|v| v.as_u64()),
-            applies_to: o.get("applies_to").and_then(|v| v.as_array()).map(|arr| {
-                arr.iter()
-                    .filter_map(|s| s.as_str().map(|s| s.to_string()))
-                    .collect()
-            }),
-            script_id: o.get("script_id").and_then(|v| v.as_i64()),
-            script: o.get("script").and_then(|v| v.as_str()).map(str::to_string),
-            url: o.get("url").and_then(|v| v.as_str()).map(str::to_string),
-            timeout_ms: o.get("timeout_ms").and_then(|v| v.as_u64()),
-            retry_count: o
-                .get("retry_count")
-                .and_then(|v| v.as_u64())
-                .and_then(|v| u32::try_from(v).ok()),
-            fail_behavior: o
-                .get("fail_behavior")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            headers: o.get("headers").and_then(|v| v.as_object()).map(|obj| {
-                obj.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            }),
-        })
-    }
-    let arr = specs.as_array()?;
-    let mut guards: Vec<Box<dyn Guard>> = Vec::new();
-    for item in arr {
-        let Some(spec) = parse_spec(item) else {
-            guards.push(Box::new(MisconfiguredGuard {
-                guard_name: "guard",
-                reason: "guard spec is not a valid object with a \"kind\" field".to_string(),
-            }));
-            continue;
-        };
-        match spec.kind.as_str() {
-            "built_in" => {
-                guards.push(resolve_built_in_guard(
-                    spec.name.as_deref(),
-                    spec.max_rows,
-                    spec.applies_to,
-                ));
-            }
-            "http_webhook" => {
-                guards.push(make_http_webhook_guard(
-                    spec.url.unwrap_or_default(),
-                    spec.timeout_ms,
-                    spec.retry_count.unwrap_or(0),
-                    match spec.fail_behavior.as_deref() {
-                        Some("allow") => FailBehavior::Allow,
-                        _ => FailBehavior::Deny,
-                    },
-                    spec.headers.unwrap_or_default(),
-                ));
-            }
-            "python_script" => {
-                let guard = resolve_python_guard_script(
-                    spec.script,
-                    spec.script_id,
-                    spec.timeout_ms,
-                    guard_script_bodies,
-                );
-                guards.push(guard);
-            }
-            other => guards.push(Box::new(MisconfiguredGuard {
-                guard_name: "guard",
-                reason: format!("unsupported guard kind \"{other}\""),
-            })),
-        }
-    }
-    if guards.is_empty() {
-        None
-    } else {
-        Some(Arc::new(GuardChain::new(guards)))
-    }
-}
-
-/// Build global + per-group guard chains from the flat JSON format stored by the Studio UI.
-///
-/// The DB format mirrors `GuardrailsConfig` from the TypeScript API types:
-/// `{ global: GuardSpecDto[], groups: Record<string, GuardSpecDto[]> }`.
-fn build_guard_chains_from_db_value(
-    v: &serde_json::Value,
-    guard_script_bodies: &HashMap<i64, String>,
-) -> (Option<Arc<GuardChain>>, HashMap<String, Arc<GuardChain>>) {
-    let Some(obj) = v.as_object() else {
-        return (None, HashMap::new());
-    };
-    let global_val = obj
-        .get("global")
-        .cloned()
-        .unwrap_or(serde_json::Value::Array(vec![]));
-    let global = build_chain_from_db_specs(&global_val, guard_script_bodies);
-
-    let groups = obj
-        .get("groups")
-        .and_then(|g| g.as_object())
-        .map(|groups_obj| {
-            groups_obj
-                .iter()
-                .filter_map(|(name, specs)| {
-                    build_chain_from_db_specs(specs, guard_script_bodies)
-                        .map(|chain| (name.clone(), chain))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    (global, groups)
 }
 
 async fn fetch_engine_running_count(
@@ -4071,9 +1858,9 @@ mod tests {
         use queryflux_core::query::{ClusterGroupName, ClusterName, EngineType};
 
         use super::super::{
-            build_live_config, reconcile_targets_from_health_targets, AdapterReloadCache,
-            BreakerProbeGuard,
+            reconcile_targets_from_health_targets, AdapterReloadCache, BreakerProbeGuard,
         };
+        use crate::live_config::{compile_live_config, CompileMode, ConfigIds, LiveConfigInputs};
 
         fn state(group: &str, name: &str, breaker: bool) -> Arc<ClusterState> {
             let state = ClusterState::new(
@@ -4141,15 +1928,16 @@ mod tests {
                 "maxRunningQueries": 10
             }))
             .expect("valid group fixture");
-            let result = build_live_config(
-                &[],
-                &HashMap::from([("group".to_string(), group)]),
-                &HashMap::new(),
-                &HashMap::new(),
-                &[],
-                "group",
-                HashMap::new(),
+            let inputs = LiveConfigInputs {
+                groups: HashMap::from([("group".to_string(), group)]),
+                routing_fallback: "group".to_string(),
+                ..LiveConfigInputs::default()
+            };
+            let result = compile_live_config(
+                &inputs,
+                &ConfigIds::default(),
                 &mut cache,
+                CompileMode::Lenient,
             )
             .await;
             assert!(result.is_err(), "unknown member must reject reload");
@@ -4178,27 +1966,25 @@ mod tests {
         async fn reload(
             record: &queryflux_persistence::cluster_config::ClusterConfigRecord,
             cache: &mut AdapterReloadCache,
-        ) -> crate::LiveConfig {
+        ) -> queryflux_frontend::state::LiveConfig {
             let group: ClusterGroupConfig = serde_json::from_value(serde_json::json!({
                 "members": ["duck"],
                 "maxRunningQueries": 10
             }))
             .expect("valid group fixture");
-            build_live_config(
+            let inputs = LiveConfigInputs::from_records(
                 std::slice::from_ref(record),
-                &HashMap::from([("g".to_string(), group)]),
-                &HashMap::new(),
-                &HashMap::new(),
-                &[],
-                "g",
+                HashMap::from([("g".to_string(), group)]),
+                Vec::new(),
+                "g".to_string(),
                 HashMap::new(),
-                cache,
-            )
-            .await
-            .expect("reload succeeds")
+            );
+            compile_live_config(&inputs, &ConfigIds::default(), cache, CompileMode::Lenient)
+                .await
+                .expect("reload succeeds")
         }
 
-        async fn running(live: &crate::LiveConfig) -> u64 {
+        async fn running(live: &queryflux_frontend::state::LiveConfig) -> u64 {
             live.cluster_manager.all_cluster_states().await.unwrap()[0].running_queries
         }
 
@@ -4514,7 +2300,7 @@ mod tests {
         use queryflux_core::tags::QueryTags;
         use queryflux_guardrails::context::{GuardChainOutcome, GuardContext, GuardLayer};
 
-        use super::super::{build_chain_from_db_specs, build_chain_from_yaml_specs};
+        use crate::guards::{build_chain_from_db_specs, build_chain_from_yaml_specs};
 
         fn is_blocked(o: &GuardChainOutcome) -> bool {
             matches!(o, GuardChainOutcome::Blocked { .. })
