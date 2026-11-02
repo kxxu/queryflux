@@ -14,7 +14,7 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
-duckdb = { version = "1.85.1" }
+duckdb = { version = "1.20000.1" , features = ["parquet"]}
 mysql_async = { workspace = true }
 arrow = { workspace = true }
 futures = { workspace = true }

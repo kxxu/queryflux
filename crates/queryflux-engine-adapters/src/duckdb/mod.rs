@@ -236,9 +236,14 @@ impl DuckDbAdapter {
     }
     fn init_connection(conn: &duckdb::Connection, config: &DuckDbConfig) -> Result<()> {
         conn.execute_batch(r#"
+            install httpfs; load httpfs;
             install ducklake; load ducklake;
             install quack; load quack;
-            install httpfs; load httpfs;
+            INSTALL curl_httpfs FROM community;LOAD curl_httpfs;
+            INSTALL cache_httpfs FROM community;load cache_httpfs;
+            INSTALL cache_prewarm FROM community;LOAD cache_prewarm;
+            INSTALL bloom FROM community; load bloom;
+
         "#).map_err(|e| QueryFluxError::Engine(format!("DuckDB execute_batch install failed: {e}")))?;
 
         if let (Some(s3_endpoint), Some(auth_value)) = (&config.s3_endpoint, &config.auth) {
@@ -263,8 +268,9 @@ impl DuckDbAdapter {
                         "#, [session_token]).map_err(|e| QueryFluxError::Engine(format!("DuckDB create quack secret failed: {e}")))?;
                         let quack_endpoint = config.endpoint.as_deref().unwrap_or("quack://localhost:9494");
 
-                        // 保证前缀正确，例如 quack://localhost:9494
-                        let connection_string = if quack_endpoint.starts_with("quack://") {
+                        // 保证前缀正确，例如 quack://localhost:9494 或者 ducklake:quack:localhost:9494
+                        let connection_string = if quack_endpoint.starts_with("quack://") ||
+                            quack_endpoint.starts_with("ducklake:") {
                             quack_endpoint.to_string()
                         } else {
                             format!("quack://{}", quack_endpoint)
@@ -272,9 +278,16 @@ impl DuckDbAdapter {
                         conn.execute(r#"
                             "ATTACH ? AS remote (READ_ONLY);"
                         "#, [&connection_string]).map_err(|e| QueryFluxError::Engine(format!("DuckDB attach remote {connection_string} failed: {e}")))?;
-                        conn.execute(r#"
-                            connect remote;
-                        "#, []).map_err(|e| QueryFluxError::Engine(format!("DuckDB connect remote failed: {e}")))?;
+                        if connection_string.starts_with("quack") {
+                            conn.execute(r#"
+                                connect remote;
+                            "#, []).map_err(|e| QueryFluxError::Engine(format!("DuckDB connect remote failed: {e}")))?;
+                        } else {
+                            conn.execute(r#"
+                                use remote;
+                            "#, []).map_err(|e| QueryFluxError::Engine(format!("DuckDB use remote failed: {e}")))?;
+                        }
+
 
                         info!("init duckDB quack success, quack endpoint: {quack_endpoint}");
                     } else {
