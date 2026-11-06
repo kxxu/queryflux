@@ -243,6 +243,8 @@ impl DuckDbAdapter {
             INSTALL cache_httpfs FROM community;load cache_httpfs;
             INSTALL cache_prewarm FROM community;LOAD cache_prewarm;
             INSTALL bloom FROM community; load bloom;
+            INSTALL tessera FROM community; load tessera;
+            INSTALL factorize FROM community;load factorize;SET factorize_mode = 'auto';
 
         "#).map_err(|e| QueryFluxError::Engine(format!("DuckDB execute_batch install failed: {e}")))?;
 
